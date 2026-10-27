@@ -50,6 +50,67 @@ function Test-Ancestor {
     return ($LASTEXITCODE -eq 0)
 }
 
+# Leftover-parking equivalence: is this file the SAME file as that one?
+#   'Equal'      - byte-identical (SHA-1 fast path, no subprocess)
+#   'Equivalent' - same content once line-ending / whitespace / blank-line formatting is
+#                  ignored (Windows artifacts: CRLF vs LF, tabs-vs-spaces re-indent,
+#                  editors adding blank lines or a final newline) - hashing alone would
+#                  wrongly escalate these to a leftover CONFLICT
+#   'BomOnly'    - content identical after stripping a leading UTF-8 BOM from ONE side.
+#                  A BOM is often added or removed DELIBERATELY (Windows editors vs
+#                  git/text tooling), so it is never auto-equated - call sites keep both
+#                  copies and emit a dedicated BOM notification instead of guessing.
+#   'Different'  - real content difference
+# Fallback: `git diff --no-index --quiet` with (verified empirically, see README):
+#   --ignore-cr-at-eol     line endings (CR at EOL)
+#   --ignore-space-change  whitespace-amount changes (-b)
+#   --ignore-all-space     ANY whitespace difference incl. indentation and tabs vs
+#                          spaces (-w; superset of -b and --ignore-space-at-eol)
+#   --ignore-blank-lines   added/removed all-blank lines (also covers a missing/extra
+#                          final newline, which presents as a blank-line difference)
+# exit 0 = equivalent, anything else = different (then BOM-only is checked). Binary
+# files are byte-compared (hash path; ignore-flags never apply to binary content).
+function Get-FileEquivalence {
+    param(
+        [Parameter(Mandatory = $true)] [string]$PathA,
+        [Parameter(Mandatory = $true)] [string]$PathB
+    )
+    try {
+        if ((Get-FileHash -LiteralPath $PathA -ErrorAction Stop).Hash -eq
+            (Get-FileHash -LiteralPath $PathB -ErrorAction Stop).Hash) { return 'Equal' }
+    } catch {
+        return 'Different'
+    }
+    Invoke-Git -Query -CommandArgs @('diff', '--no-index', '--quiet', '--ignore-cr-at-eol', '--ignore-space-change', '--ignore-all-space', '--ignore-blank-lines', '--', $PathA, $PathB)
+    if ($LASTEXITCODE -eq 0) { return 'Equivalent' }
+    # BOM-only detection: a leading UTF-8 BOM is content, not whitespace, so the ignore
+    # flags cannot equate it - but it deserves a dedicated message instead of the generic
+    # "differs" one (BOM changes are frequently deliberate; never auto-resolved).
+    try {
+        $bytesA = [System.IO.File]::ReadAllBytes($PathA)
+        $bytesB = [System.IO.File]::ReadAllBytes($PathB)
+        $hasBomA = ($bytesA.Length -ge 3 -and $bytesA[0] -eq 0xEF -and $bytesA[1] -eq 0xBB -and $bytesA[2] -eq 0xBF)
+        $hasBomB = ($bytesB.Length -ge 3 -and $bytesB[0] -eq 0xEF -and $bytesB[1] -eq 0xBB -and $bytesB[2] -eq 0xBF)
+        # Exactly one side has a BOM and the byte lengths differ by exactly those 3 bytes.
+        if (($hasBomA -xor $hasBomB) -and [Math]::Abs($bytesA.Length - $bytesB.Length) -eq 3) {
+            $contentA = $bytesA
+            $contentB = $bytesB
+            if ($hasBomA) { $contentA = New-Object byte[] ($bytesA.Length - 3); if ($contentA.Length -gt 0) { [System.Array]::Copy($bytesA, 3, $contentA, 0, $contentA.Length) } }
+            if ($hasBomB) { $contentB = New-Object byte[] ($bytesB.Length - 3); if ($contentB.Length -gt 0) { [System.Array]::Copy($bytesB, 3, $contentB, 0, $contentB.Length) } }
+            $same = ($contentA.Length -eq $contentB.Length)
+            if ($same) {
+                for ($i = 0; $i -lt $contentA.Length; $i++) {
+                    if ($contentA[$i] -ne $contentB[$i]) { $same = $false; break }
+                }
+            }
+            if ($same) { return 'BomOnly' }
+        }
+    } catch {
+        # fall through to 'Different'
+    }
+    return 'Different'
+}
+
 # BaseBranch must be provided explicitly; no default inside the script.
 if ([string]::IsNullOrWhiteSpace($BaseBranch)) {
     Write-Host "Error: base branch is required." -ForegroundColor Red
@@ -273,16 +334,19 @@ if ($untrackedList.Count -gt 0) {
             if (Test-Path -LiteralPath $dst) {
                 # A parked copy for this path already exists (previous run kept it, or a
                 # previous suffix parked here). Never lose either copy:
-                #   identical bytes -> the parked copy already holds them; free the path.
-                #   different bytes -> park under a unique suffix and record the mapping.
+                #   equivalent content -> the parked copy already holds it; free the path.
+                #   different content  -> park under a unique suffix and record the mapping.
                 $dstIsDir = (Get-Item -LiteralPath $dst) -is [System.IO.Directory]
                 $srcIsDir = (Get-Item -LiteralPath $src) -is [System.IO.Directory]
-                $same = $false
+                $eq = 'Different'
                 if (-not $dstIsDir -and -not $srcIsDir) {
-                    try { $same = ((Get-FileHash -LiteralPath $src).Hash -eq (Get-FileHash -LiteralPath $dst).Hash) } catch { $same = $false }
+                    $eq = Get-FileEquivalence $src $dst
                 }
-                if ($same) {
-                    Write-Host ('  $ Remove-Item "' + $rel + '"  # identical copy already parked') -ForegroundColor DarkGray
+                if ($eq -eq 'Equal' -or $eq -eq 'Equivalent') {
+                    Write-Host ('  $ Remove-Item "' + $rel + '"  # equivalent copy already parked') -ForegroundColor DarkGray
+                    if ($eq -eq 'Equivalent') {
+                        Write-Host "       (equal ignoring whitespace/line-endings/blank lines; parked copy kept)" -ForegroundColor DarkGray
+                    }
                     try {
                         Remove-Item -LiteralPath $src -Recurse -Force -ErrorAction Stop
                         if ($manifestLines -notcontains $rel) { $manifestLines += $rel }
@@ -292,6 +356,11 @@ if ($untrackedList.Count -gt 0) {
                         Write-Host ("Warning: could not free '" + $rel + "': " + $_.Exception.Message) -ForegroundColor Yellow
                         continue
                     }
+                }
+                if ($eq -eq 'BomOnly') {
+                    # BOM differences are frequently deliberate - never auto-resolved;
+                    # keep BOTH copies (suffix-parked below) and say so explicitly.
+                    Write-Host ("       (differs only by a UTF-8 BOM - kept both copies; BOM changes can be deliberate)") -ForegroundColor DarkGray
                 }
                 $n = 2
                 do {
@@ -675,11 +744,16 @@ Write-Host "========================================" -ForegroundColor Green
     # Return parked untracked files under the content rules (see the park block for the
     # full rationale). The manifest is the source of truth, so entries from a previously
     # KILLED run are re-attempted here too (self-healing).
-    if (Test-Path $manifestPath) {
+    if ($DryRun -and (Test-Path $manifestPath)) {
+        Write-Host ""
+        Write-Host " (dry run) parked file(s) from a previous run exist under $leftoverDir;" -ForegroundColor DarkGray
+        Write-Host "           a real run would restore them. Nothing executed now." -ForegroundColor DarkGray
+    } elseif (Test-Path $manifestPath) {
         Write-Host ""
         $entries = @([System.IO.File]::ReadAllLines($manifestPath) | Where-Object { $_ })
         $returned = 0
         $identicalDropped = 0
+        $normalizedDropped = 0
         $unresolved = @()
         foreach ($lineSpec in $entries) {
           try {
@@ -711,14 +785,10 @@ Write-Host "========================================" -ForegroundColor Green
                 Write-Host ("  parked copy: " + $src) -ForegroundColor Yellow
                 continue
             }
-            $same = $false
-            try {
-                $same = ((Get-FileHash -LiteralPath $src).Hash -eq (Get-FileHash -LiteralPath $dst).Hash)
-            } catch {
-                $same = $false
-            }
-            if ($same) {
-                # Identical content: the rebuilt file IS the leftover - drop the parked copy.
+            $eq = Get-FileEquivalence $src $dst
+            if ($eq -eq 'Equal' -or $eq -eq 'Equivalent') {
+                # Equivalent content (byte-identical OR equal modulo whitespace/line-endings):
+                # the rebuilt file IS the leftover - drop the parked copy.
                 # Removal failures must NOT be counted as success, or the manifest would be
                 # deleted while the file stays parked (orphaned with no tracking). PS5.1's
                 # Remove-Item -Force is known to throw NullReferenceException on some paths;
@@ -740,19 +810,37 @@ Write-Host "========================================" -ForegroundColor Green
                     }
                 }
                 if ($droppedOk) {
-                    $identicalDropped++
+                    if ($eq -eq 'Equivalent') {
+                        $normalizedDropped++
+                        Write-Host (" note: '" + $origRel + "' differs only in whitespace/line-endings/blank lines -") -ForegroundColor DarkGray
+                        Write-Host ("       treated as the same file; parked copy dropped, rebuilt version kept.") -ForegroundColor DarkGray
+                    } else {
+                        $identicalDropped++
+                    }
                 } else {
                     $unresolved += $lineSpec
                     Write-Host ("Warning: could not delete identical parked copy '" + $origRel + "'; kept for retry.") -ForegroundColor Yellow
                 }
             } else {
                 $unresolved += $lineSpec
-                Write-Host ("LEFTOVER CONFLICT: '" + $origRel + "' differs from the rebuilt file at the same path.") -ForegroundColor Red
-                Write-Host ("  worktree keeps the REBUILT version; your leftover is parked at:") -ForegroundColor Yellow
-                Write-Host ("    " + $src) -ForegroundColor Yellow
-                Write-Host ("  Compare:  git diff --no-index `"" + $src + "`" `"" + $dst + "`"") -ForegroundColor Yellow
-                Write-Host ("  To use your leftover, copy it over (it becomes an uncommitted change);") -ForegroundColor Yellow
-                Write-Host ("  otherwise delete the parked copy when you're done.") -ForegroundColor Yellow
+                if ($eq -eq 'BomOnly') {
+                    # Content is identical except a leading UTF-8 BOM on one side.
+                    # Deliberately NOT auto-resolved (BOM is often added/removed on
+                    # purpose) - notify precisely instead of the generic "differs".
+                    Write-Host ("BOM DIFFERENCE: '" + $origRel + "' differs ONLY by a leading UTF-8 BOM (present in one copy, absent in the other).") -ForegroundColor Red
+                    Write-Host ("  BOM is often added or removed DELIBERATELY (Windows editors vs git/text tooling) - not auto-resolved.") -ForegroundColor Yellow
+                    Write-Host ("  worktree keeps the REBUILT version; your leftover is parked at:") -ForegroundColor Yellow
+                    Write-Host ("    " + $src) -ForegroundColor Yellow
+                    Write-Host ("  Inspect:  git diff --no-index `"" + $src + "`" `"" + $dst + "`"") -ForegroundColor Yellow
+                    Write-Host ("  Decide: keep whichever side should carry the BOM (copy the parked file over, or strip/add its BOM).") -ForegroundColor Yellow
+                } else {
+                    Write-Host ("LEFTOVER CONFLICT: '" + $origRel + "' differs from the rebuilt file at the same path.") -ForegroundColor Red
+                    Write-Host ("  worktree keeps the REBUILT version; your leftover is parked at:") -ForegroundColor Yellow
+                    Write-Host ("    " + $src) -ForegroundColor Yellow
+                    Write-Host ("  Compare:  git diff --no-index `"" + $src + "`" `"" + $dst + "`"") -ForegroundColor Yellow
+                    Write-Host ("  To use your leftover, copy it over (it becomes an uncommitted change);") -ForegroundColor Yellow
+                    Write-Host ("  otherwise delete the parked copy when you're done.") -ForegroundColor Yellow
+                }
             }
           } catch {
             # One entry must never abort (or silently skip) the rest - keep it tracked.
@@ -764,6 +852,7 @@ Write-Host "========================================" -ForegroundColor Green
         $notes = @()
         if ($returned -gt 0) { $notes += "$returned returned unchanged" }
         if ($identicalDropped -gt 0) { $notes += "$identicalDropped identical leftover(s) dropped (rebuilt file kept)" }
+        if ($normalizedDropped -gt 0) { $notes += "$normalizedDropped leftover(s) dropped as equal ignoring whitespace/line-endings/blank lines" }
         if ($notes.Count -gt 0) {
             Write-Host ("Untracked leftovers: " + ($notes -join '; ') + ".") -ForegroundColor Green
         }
