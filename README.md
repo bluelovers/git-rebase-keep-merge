@@ -37,7 +37,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 ## 版本狀態
 
-**ps1 最後更新：2026-08-27（本次收尾：--binary 實測通過，無 ps1 改動）**
+**ps1 最後更新：2026-08-27（本次收尾：未提交變更/未追蹤檔不再拒絕執行，改 stash 保護）**
 
 已實作：
 
@@ -46,7 +46,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 - banner 顯示目前分支、臨時分支、patch 目錄、dry-run/tag 模式
 - `Invoke-Git` 輔助函式（印指令、`-Query` 總是執行、`-Capture` 回傳輸出）
 - `Test-Ancestor` 輔助函式（唯讀、會印出指令）
-- 起跑前守衛：merge / cherry-pick / rebase / revert 進行中一律拒絕；工作樹有已追蹤檔案修改一律拒絕
+- 起跑前守衛：merge / cherry-pick / rebase / revert 進行中一律拒絕（屬衝突狀態）；**髒工作樹不再拒絕**（見下方 stash 機制）
 - **merge 判定只看 parentCount**：單親但訊息以 "Merge" 開頭的提交走 cherry-pick，不會把舊歷史拖回祖先
 - **方案 (b) 空合併**：所有 side parent 已含於 HEAD 時，`git commit-tree HEAD^{tree} -p HEAD -p <targets>` + `reset --hard` 建空合併 commit，節點 1:1 保留（Mneo 類案例不再被靜默丟棄）
 - **octopus（3+ 父）**：`git merge --no-ff ^2 ^3 ...` 一次合併全部 side parent，保持 1:1 節點且內容不遺失
@@ -59,6 +59,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 - **patch-first 重放（本次改動，修復 rename 內容分歧）**：合併節點改為先 `git apply --index` 套用第一父 patch（`diff P1..M`，即該合併對主線的內容貢獻定義、context 最嚴格）；只有 context 過期（跨版本，如 Mneo 佈局）才退回 `git merge --no-ff`，merge 衝突再走 `apply --3way`。**根因**：主線 cherry-pick 改了 hash → `git merge` 的 `merge-base(重放主線, 側支)` 退回更早祖先、無從偵測 rename → 靜默 add/add 把新舊路徑都留下且不觸發 fallback → 分歧；`git apply` 用第一父 blob 當基準能正確重現 rename。空 patch（內容中立合併，如 rename/rename 手動解）則直接 `commit-tree` 建節點、不碰內容
 
 - **preflight 守衛後的衝突復原指引（本次新增）**：`pause` 後若未解決（非互動／stdin 重導向下立即返回），`write-tree` 失敗改為偵測 unmerged 路徑並印出明確復原步驟（列出未合併檔 → `git add -u` → `git reset --hard HEAD` 捨棄重跑），不再只印技術性 `index not in a committable state`
+- **未提交變更／未追蹤檔不再拒絕執行（本次改動）**：改用 stash 機制 — 起跑時把**已追蹤**的未提交變更（含 staged）`git stash push`，主體包進 `try{...}finally{...}` 結束時 `git stash pop --index` 還原（`finally` 在 `exit` 時仍執行、保留退出碼，實測驗證）。這樣變更既**不被拒絕**、也**不進 commit**（write-tree 只寫索引，暫存變更已 stash 離開）、更**不遺失**。未追蹤檔留原地（cherry-pick/merge/write-tree 從不暫存它們 → 不可能被提交；撞名=衝突，屬允許的例外）。finally 的 pop 失敗分兩種成因給對應指引：(a) pop **前**索引就有 unmerged（重建停在衝突中）→ 先修索引再 pop；(b) pop 前索引乾淨、pop 才衝突（stash 與重建改到同幾行）→ 真內容衝突。dry-run 不建立 stash、只印計畫。
 - **`pause` 全手動路徑實測通過**：用 base 前移夾具湊齊三重條件（patch context 漂移 + `git merge` 衝突 + `apply --3way` 失敗）→ 正確抵達 `Pausing: resolve conflicts...`；重跑時 preflight 守衛正確擋下未解決的 `UU` 狀態
 
 已知限制：
@@ -91,11 +92,14 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 | 7 | `tmp/rebuild-rename-001` | neo | 4 節點：c1 → merge side-a（純改名 → moved.txt）→ **merge side-b（rename/rename 衝突，手動保留 moved.txt）** → c2 | PASS（patch-first 修復後）：4==4 節點、tree 完全相同 `4111f4cb`、側支 tip 可達、原合併脫離。side-a 走 `git apply --index` 正確重現 rename（不再被 merge-base 斷裂破壞）；side-b 空 patch 走內容中立 `commit-tree`、不碰內容 |
 | 8 | `tmp/rebuild-mixedrename-001` | neo | 3 節點：c1 建檔 → **merge side（rename + 改內容在同一提交，63% similarity 帶 hunk 的 rename patch）** → c2 | PASS：3==3 節點、tree 完全相同、rename 與內容改動都保留（`mixfile-renamed.txt` 且 line3-CHANGED）、側支 tip 可達、原合併脫離。確認 patch-first 的 `git apply --index` 能處理「rename 且帶內容 hunk」的 patch |
 | 9 | 空範圍守衛 | neo | `neo neo` 與 `neo 0c388f8b`（feature 已含於 base） | PASS：皆印 `Nothing to rebuild`、exit 0 |
-| 10 | preflight 守衛 | neo | ①髒已追蹤檔（`M webui.py`）②進行中 merge（`.git/MERGE_HEAD` 殘留）③進行中 cherry-pick（`CHERRY_PICK_HEAD` 殘留） | PASS：三種情形皆正確拒絕、印出明確原因與復原提示、exit 1，未動任何分支。（rebase/revert 守衛同源 `Test-Path` 機制，未單獨實測） |
+| 10 | preflight 守衛 | neo | ①進行中 merge（`.git/MERGE_HEAD` 殘留）②進行中 cherry-pick（`CHERRY_PICK_HEAD` 殘留） | PASS：兩種皆正確拒絕、印出明確原因與復原提示、exit 1，未動任何分支。（rebase/revert 守衛同源 `Test-Path` 機制，未單獨實測。**髒工作樹已改為不再拒絕**，見案例 15） |
 | 11 | `tmp/rebuild-manual-001` | ad607938→**neo** | 3 節點：c1 → merge side（改 PIPELINE_PATHS 同一行）→ c2；重建到**較新的** neo 觸發三重條件 | PASS：三條件全中（`apply --index` context drifted → `git merge` 衝突 → `apply --3way` 失敗 → **Pausing** 正確抵達）。非互動下 write-tree 失敗 → 改進後訊息列出 unmerged 檔 + `git add -u` + `git reset --hard HEAD` 復原指引；重跑 preflight 守衛正確擋下 `UU` 狀態 |
 | 12 | 路徑含空格 | neo | `-PatchDir '.git/rebuild patches'`（含空格目錄）對 `tmp/rebuild-conflict-001` 乾跑+實跑 | PASS：`git diff --output=<含空格路徑>` 正確寫入、`git apply --index <含空格路徑>` 正確套用、tree 完全相符；dry-run 正確印出含空格路徑且不建立目錄。證明 PowerShell 陣列 splatting 把含空格路徑當單一參數傳給 git |
 | 13 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
 | 14 | `tmp/rebuild-binary-001` | ad607938→**neo** | 4 節點：c1 建文字+二進位 v1 → c2 → **merge side（二進位 v2 + 改 PIPELINE 同一行）** → c3；重建到較新的 neo 觸發 drift→fallback | PASS：`git diff --binary` 產生含 `GIT binary patch` payload 的 patch；`apply --3way` 對二進位回 `Applied patch 'rebuildpayload.dat' cleanly`（文字檔才是 `with conflicts`）、工作目錄還原 v2；finish（write-tree+commit-tree）保留暫存二進位（blob `032c6bee`=v2）。`Pausing` 由文字衝突觸發，與二進位無關 |
+| 15 | 未提交變更／未追蹤檔 | neo | staged（`M  LICENSE`）+ unstaged（` M launch.py`）+ 未追蹤檔，對 `mixed-001` 實跑 | PASS：不拒絕、EXIT=0、`stash push → 重建 → stash pop --index` 全流程；`git log -S` 兩個標記查無 → **變更未進任何 commit**；還原後 staged 保持 staged、unstaged 保持 unstaged；未追蹤檔存在且未動；tree 仍與 source 完全相同 |
+| 16 | stash 失敗分支 | neo | (a) `manual-001` 讓重建停在自身衝突 (b) 改 `processing.py` 尾端與重建同區 → pop 衝突 | PASS：(a) exit 1、pop 前偵測索引有 unmerged → 訊息「rebuild STOPPED」+ 先修索引再 pop、stash 保留；(b) 重建成功、索引乾淨、pop 衝突 → 訊息「CONFLICT with rebuilt content」、stash 保留。**修正前** (b) 被誤判成 (a)（pop 自身留 unmerged），改為 **pop 前**檢查索引後正確分流 |
+| 17 | dry-run + 髒工作樹 | neo | staged + unstaged 變更下乾跑 | PASS：不建立 stash（只印 would stash 計畫）、EXIT=0、變更完整保留 |
 
 夾具設計要點：
 

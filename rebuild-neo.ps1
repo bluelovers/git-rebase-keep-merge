@@ -83,14 +83,11 @@ if ($InProgress.Count -gt 0) {
     exit 1
 }
 
-# Refuse to run when tracked files are already modified: replay would mix our changes into the result.
-$DirtyTracked = git status --porcelain --untracked-files=no
-if ($LASTEXITCODE -eq 0 -and $DirtyTracked) {
-    Write-Host "Error: the working tree has modified tracked files:" -ForegroundColor Red
-    $DirtyTracked | Select-Object -First 10 | ForEach-Object { Write-Host ("       " + $_) -ForegroundColor Red }
-    Write-Host "       Commit or stash them first so the rebuild starts from a clean tree." -ForegroundColor Red
-    exit 1
-}
+# Uncommitted TRACKED changes and untracked files do NOT block the rebuild: they are
+# stashed just before the replay (untracked files are never staged by cherry-pick/merge/
+# write-tree, so they can't enter the result) and restored in `finally` - so they are
+# neither committed into the rebuilt history nor lost. See the stash block before checkout.
+# A merge/cherry-pick already in progress above still aborts: that is a conflict state.
 
 # Branch we started on, captured before any checkout, for display purposes.
 $StartBranch = git branch --show-current
@@ -178,6 +175,31 @@ $absolutePatchPath = if ([System.IO.Path]::IsPathRooted($PatchDir)) {
 } else {
     [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $PatchDir))
 }
+
+# Stash uncommitted TRACKED changes so they can neither leak into the replay
+# (write-tree commits the INDEX - a staged file would be swept into a merge commit)
+# nor be destroyed (checkout / the drift path's reset --hard). Untracked files are
+# intentionally left in place: cherry-pick, merge and write-tree never stage them,
+# so they cannot enter the rebuilt result; if one collides with a path the replay
+# creates, git reports it as a conflict (the one allowed exception). The stash is
+# popped again in `finally`, so even an early `exit` cannot strand your changes.
+$Stashed = $false
+$TrackedChanges = Invoke-Git -Query -CommandArgs @('status', '--porcelain', '--untracked-files=no')
+if ($TrackedChanges) {
+    Write-Host " Uncommitted tracked changes detected - they will be stashed first:" -ForegroundColor Yellow
+    $TrackedChanges | Select-Object -First 10 | ForEach-Object { Write-Host ("       " + $_) -ForegroundColor DarkGray }
+    Invoke-Git -CommandArgs @('stash', 'push', '-m', 'rebuild-neo auto-stash')
+    if ($DryRun) {
+        Write-Host "  -> (dry run) would stash the changes above, then pop them again at the end." -ForegroundColor DarkGray
+    } elseif ($LASTEXITCODE -eq 0) {
+        $Stashed = $true
+        Write-Host "  -> Changes stashed (safe in git stash); popped again at the end." -ForegroundColor DarkYellow
+    } else {
+        Write-Host "Warning: could not stash the changes - continuing anyway; a later step may fail." -ForegroundColor Yellow
+    }
+}
+
+try {
 
 # -B creates the temp branch, or resets it to base when -f is given.
 $CheckoutAction = if ($Force) { "-B" } else { "-b" }
@@ -472,3 +494,39 @@ Write-Host " To discard the rebuild instead:" -ForegroundColor Cyan
 Write-Host "   git checkout $FeatureBranch" -ForegroundColor White
 Write-Host "   git branch -D $NewBranch" -ForegroundColor White
 Write-Host "========================================" -ForegroundColor Green
+} finally {
+    # Restore uncommitted tracked changes stashed before the replay. This runs on normal
+    # completion AND on every early `exit` (verified: PowerShell executes `finally` on exit).
+    # --index re-stages what was staged, so staged-vs-unstaged state is preserved.
+    if ($Stashed) {
+        Write-Host ""
+        # Decide the failure cause BEFORE popping: a failed `stash pop` leaves its OWN
+        # unmerged paths behind, so checking after the pop cannot tell (a) from (b).
+        #   (a) index ALREADY unmerged before the pop => the rebuild itself stopped mid-
+        #       conflict; pop would fail to even write the index. Skip it, fix that first.
+        #   (b) index clean before the pop => attempt it; if it then fails, the stash
+        #       genuinely conflicts with the rebuilt content.
+        $preUnmerged = git diff --name-only --diff-filter=U
+        if ($preUnmerged) {
+            Write-Host "Your changes could not be restored yet: the rebuild STOPPED with" -ForegroundColor Red
+            Write-Host "unresolved conflicts, and the index must be clean before the stash pops:" -ForegroundColor Red
+            $preUnmerged | ForEach-Object { Write-Host ("  " + $_) -ForegroundColor Red }
+            Write-Host "Resolve those (or 'git reset --hard HEAD' to abandon this temp branch), then:" -ForegroundColor Yellow
+            Write-Host "  git stash list        # your changes are SAFE here ('rebuild-neo auto-stash')" -ForegroundColor Yellow
+            Write-Host "  git stash pop --index # restore them after the index is clean" -ForegroundColor Yellow
+        } else {
+            Invoke-Git -CommandArgs @('stash', 'pop', '--index')
+            if ($DryRun) {
+                Write-Host "  -> (dry run) stash was not created; nothing to pop." -ForegroundColor DarkGray
+            } elseif ($LASTEXITCODE -ne 0) {
+                Write-Host "Could not restore your stashed changes automatically: they CONFLICT with the" -ForegroundColor Red
+                Write-Host "rebuilt content (the rebuild changed lines you had also edited). Your changes" -ForegroundColor Red
+                Write-Host "are SAFE in the stash:" -ForegroundColor Red
+                Write-Host "  git stash list         # find 'rebuild-neo auto-stash'" -ForegroundColor Yellow
+                Write-Host "  git stash pop --index  # retry once you've inspected/resolved" -ForegroundColor Yellow
+            } else {
+                Write-Host "Your uncommitted changes were restored (staged state preserved)." -ForegroundColor Green
+            }
+        }
+    }
+}
