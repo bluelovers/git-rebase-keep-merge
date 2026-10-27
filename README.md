@@ -35,7 +35,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 ## 版本狀態
 
-**ps1 最後更新：2026-08-27（本次收尾：patch-first 新增 rename+內容混合夾具驗證，無 ps1 改動）**
+**ps1 最後更新：2026-08-27（本次收尾：preflight 守衛實測通過，無 ps1 改動）**
 
 已實作：
 
@@ -64,8 +64,10 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 - **`--binary` 實測**：`git diff --binary` 已加入但尚未用含二進位檔的衝突夾具驗證（需在夾具中放一個兩側都改的二進位檔，確認 `apply --3way` 還原正確）
 - 衝突 fallback 的 `pause` 路徑（apply 也失敗、需完全手動解決）仍未實測 — 目前夾具的 patch 都能乾淨套用
-- ~~patch-first 對「rename + 同時內容也改動」的組合尚未有專屬夾具~~（已驗證，見案例 8 `tmp/rebuild-mixedrename-001`）
-- repo 路徑含空格、`commit.gpgsign=true` 與 pre-commit/commit-msg hook、重建中斷後重跑的恢復行為
+- ~~patch-first 對「rename + 同時內容也改動」的組合尚未有專屬夾具~~（已驗證，見案例 8）
+- ~~preflight 守衛（髒工作樹／進行中操作）~~（已實測，見案例 10）
+- rebase / revert 進行中守衛未單獨實測（與 merge/cherry-pick 同源 `Test-Path` 機制）
+- repo 路徑含空格、`commit.gpgsign=true` 與 pre-commit/commit-msg hook
 
 ## 測試案例
 
@@ -82,7 +84,8 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 | 7 | `tmp/rebuild-rename-001` | neo | 4 節點：c1 → merge side-a（純改名 → moved.txt）→ **merge side-b（rename/rename 衝突，手動保留 moved.txt）** → c2 | PASS（patch-first 修復後）：4==4 節點、tree 完全相同 `4111f4cb`、側支 tip 可達、原合併脫離。side-a 走 `git apply --index` 正確重現 rename（不再被 merge-base 斷裂破壞）；side-b 空 patch 走內容中立 `commit-tree`、不碰內容 |
 | 8 | `tmp/rebuild-mixedrename-001` | neo | 3 節點：c1 建檔 → **merge side（rename + 改內容在同一提交，63% similarity 帶 hunk 的 rename patch）** → c2 | PASS：3==3 節點、tree 完全相同、rename 與內容改動都保留（`mixfile-renamed.txt` 且 line3-CHANGED）、側支 tip 可達、原合併脫離。確認 patch-first 的 `git apply --index` 能處理「rename 且帶內容 hunk」的 patch |
 | 9 | 空範圍守衛 | neo | `neo neo` 與 `neo 0c388f8b`（feature 已含於 base） | PASS：皆印 `Nothing to rebuild`、exit 0 |
-| 10 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
+| 10 | preflight 守衛 | neo | ①髒已追蹤檔（`M webui.py`）②進行中 merge（`.git/MERGE_HEAD` 殘留）③進行中 cherry-pick（`CHERRY_PICK_HEAD` 殘留） | PASS：三種情形皆正確拒絕、印出明確原因與復原提示、exit 1，未動任何分支。（rebase/revert 守衛同源 `Test-Path` 機制，未單獨實測） |
+| 11 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
 
 夾具設計要點：
 
