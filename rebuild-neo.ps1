@@ -287,15 +287,38 @@ foreach ($c in $commits) {
 
             Invoke-Git -CommandArgs @('merge', '--abort')
             Invoke-Git -CommandArgs @('apply', '--3way', '--index', $targetPatchFile)
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "  -> Patch applied successfully! Staging and finishing merge..." -ForegroundColor Green
-                Invoke-Git -CommandArgs @('add', '-u')
-                Invoke-Git -CommandArgs @('commit', '-m', $commitMessage)
-            } else {
-                Write-Host "  -> Warning: patch failed to apply or conflicts cannot be resolved automatically!" -ForegroundColor Red
-                Write-Host "  -> Script paused. Resolve conflicts manually, then run: git add -u; git commit -m `"$commitMessage`", and press any key to continue..." -ForegroundColor Red
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "  -> Patch could not apply cleanly. Pausing: resolve conflicts in the working tree," -ForegroundColor Red
+                Write-Host "  ->    stage the result with 'git add -u', then press any key to continue..." -ForegroundColor Red
                 pause
+            } else {
+                Write-Host "  -> Patch applied successfully! Finishing as a real merge commit..." -ForegroundColor Green
             }
+
+            # Finish with write-tree + commit-tree (NOT a plain `git commit`): the node keeps
+            # its merge structure - HEAD plus every side parent - so the side tips stay
+            # reachable and the rebuilt node mapping stays 1:1. A plain commit here would
+            # silently degrade the merge into a single-parent commit.
+            $mergedTree = Invoke-Git -Capture -CommandArgs @('write-tree')
+            if ($LASTEXITCODE -ne 0 -or "$mergedTree" -notmatch '^[0-9a-f]{7,40}$') {
+                Write-Host "  -> Error: git write-tree failed - index not in a committable state." -ForegroundColor Red
+                exit 1
+            }
+            $ctArgs = @('commit-tree', "$mergedTree".Trim(), '-p', 'HEAD')
+            foreach ($t in $sideParents) { $ctArgs += @('-p', $t) }
+            $ctArgs += @('-m', $commitMessage)
+            $newCommit = Invoke-Git -Capture -CommandArgs $ctArgs
+            if ($LASTEXITCODE -ne 0 -or "$newCommit" -notmatch '^[0-9a-f]{7,40}$') {
+                Write-Host "  -> Error: commit-tree failed while finishing the fallback merge." -ForegroundColor Red
+                exit 1
+            }
+            $newCommit = "$newCommit".Trim()
+            Invoke-Git -CommandArgs @('reset', '--hard', $newCommit)
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "  -> Error: failed to attach the fallback merge commit $newCommit" -ForegroundColor Red
+                exit 1
+            }
+            Write-Host "  -> Fallback merge commit created: $($newCommit.Substring(0,8)) (structure preserved)" -ForegroundColor Green
         } else {
             Write-Host "  -> Merge completed cleanly, no conflicts." -ForegroundColor Green
         }

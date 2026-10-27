@@ -11,6 +11,7 @@
 | `rebuild-neo-tests/build-mixed-001.ps1` | 夾具分支 `tmp/rebuild-mixed-001` 建構腳本（base=neo） |
 | `rebuild-neo-tests/build-mixed-neo-001.ps1` | 夾具分支 `tmp/rebuild-mixed-neo-001` 建構腳本（base=ad607938，含中段合併 neo） |
 | `rebuild-neo-tests/build-edge-001.ps1` | 夾具分支 `tmp/rebuild-edge-001` 建構腳本（單親 Merge 訊息、空提交、octopus） |
+| `rebuild-neo-tests/build-conflict-001.ps1` | 夾具分支 `tmp/rebuild-conflict-001` 建構腳本（必然衝突，含手動解決步驟） |
 
 ## 工作流程
 
@@ -31,7 +32,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 ## 版本狀態
 
-**ps1 最後更新：2026-08-27 11:0x（本次收尾）**
+**ps1 最後更新：2026-08-27（本次收尾：衝突 fallback 實測並修復結構退化）**
 
 已實作：
 
@@ -47,11 +48,13 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 - **patch 加 `--binary`**：衝突 fallback 的 `git apply --3way` 能還原二進位檔
 - **空範圍守衛**：base==feature 或 feature 已含於 base 時印 `Nothing to rebuild` 並 exit 0，不再誤印 completed
 - **空提交**：cherry-pick 前用 `git diff --quiet` 偵測，空提交自動加 `--allow-empty`
+- **衝突 fallback 收尾改為真合併結構**（本次實測發現原 `add -u` + `commit` 會把合併節點退化成單親 commit、側支 tip 失聯）：現為 `write-tree` + `commit-tree -p HEAD -p <targets>` + `reset --hard`，節點保持 MERGE 且側支 tip 可達；`apply --3way` 失敗時暫停，提示手動解決並 `git add -u` 後繼續，同一段 commit-tree 邏輯收尾
 
-仍待辦：
+待辦（未來可參考）：
 
-- **衝突 fallback 路徑從未被實測過**（目前所有測試仍零衝突）：`merge --abort` → `apply --3way` → `commit`、`--binary` 實效、`pause` 行為皆未驗證；下一個夾具應刻意製造兩分支改同一行的必然衝突
-- CJK 訊息/分支名、路徑含空格、`commit.gpgsign`/hook、rename/模式變更穿過 fallback、中斷後重跑
+- **`--binary` 實測**：`git diff --binary` 已加入但尚未用含二進位檔的衝突夾具驗證（需在夾具中放一個兩側都改的二進位檔，確認 `apply --3way` 還原正確）
+- 衝突 fallback 的 `pause` 路徑（apply 也失敗、需完全手動解決）仍未實測 — 目前夾具的 patch 都能乾淨套用
+- CJK commit 訊息／分支名（`-m` 編碼鏈）、repo 路徑含空格、`commit.gpgsign=true` 與 pre-commit/commit-msg hook、rename／檔案模式變更穿過 merge 與 fallback、重建中斷後重跑的恢復行為
 
 ## 測試案例
 
@@ -64,7 +67,8 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 | 3 | `tmp/rebuild-mixed-neo-001` | ad607938 | 17 節點：c1..c8 → **Mneo(#9，帶入 44 檔/498,672 行)** → 5 PR 合併 + c9/c10 夾擊 processing.py → c11 | PASS：tree `93e7b61d` 完全相同、`git diff 來源 重建` 為空、4 個跨版本 cherry-pick 全乾淨；方案 (b) 修復後 **17==17 節點 1:1**，Mneo 以空合併 commit 保留、原 Mneo 仍脫離、neo tip 為真第二父 |
 | 4 | `tmp/rebuild-edge-001` | neo | 5 節點：一般提交 → 單親 "Merge remote-tracking..." 訊息 → 空提交 → **octopus 合併 3 側支** → 一般提交 | PASS：5==5 節點、tree 相同、訊息逐行相同；單親 Merge 訊息正確走 cherry-pick 且脫離原提交、空提交以 `--allow-empty` 保留、octopus 重放為 MERGE x4 且 3 個側支 tip 全為祖先 |
 | 5 | 空範圍守衛 | neo | `neo neo` 與 `neo 0c388f8b`（feature 已含於 base） | PASS：皆印 `Nothing to rebuild`、exit 0 |
-| 6 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
+| 6 | `tmp/rebuild-conflict-001` | neo | 4 節點：c1 建檔 → merge side-a → **merge side-b（必然衝突，原始史手動解為 AB）** → c2 | PASS：fallback 觸發 2 次（含 replay 時因 cherry-pick 改變 merge-base 導致的 add/add 衝突），`apply --3way` 皆乾淨套用；4==4 節點、tree 相同、解法 `line3-AB` 被完整重現、合併節點保持 MERGE x2、側支 tip 可達、原合併脫離。**實測發現並修復**：原 fallback 以 `add -u`+`commit` 收尾會把合併退化成單親（側支失聯），已改 `write-tree`+`commit-tree` |
+| 7 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
 
 夾具設計要點：
 
