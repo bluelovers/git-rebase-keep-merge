@@ -14,6 +14,7 @@
 | `rebuild-neo-tests/build-conflict-001.ps1` | 夾具分支 `tmp/rebuild-conflict-001` 建構腳本（必然衝突，含手動解決步驟） |
 | `rebuild-neo-tests/build-cjk-001.ps1` | 夾具分支 `tmp/rebuild-cjk-001` 建構腳本（CJK 訊息／檔名／分支名） |
 | `rebuild-neo-tests/build-rename-001.ps1` | 夾具分支 `tmp/rebuild-rename-001` 建構腳本（純改名 + rename/rename 衝突，記錄已知限制） |
+| `rebuild-neo-tests/build-mixedrename-001.ps1` | 夾具分支 `tmp/rebuild-mixedrename-001` 建構腳本（rename + 內容改動在同一合併） |
 
 ## 工作流程
 
@@ -34,7 +35,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 ## 版本狀態
 
-**ps1 最後更新：2026-08-27（本次收尾：改為 patch-first 重放，修復 rename 內容分歧）**
+**ps1 最後更新：2026-08-27（本次收尾：patch-first 新增 rename+內容混合夾具驗證，無 ps1 改動）**
 
 已實作：
 
@@ -63,7 +64,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 - **`--binary` 實測**：`git diff --binary` 已加入但尚未用含二進位檔的衝突夾具驗證（需在夾具中放一個兩側都改的二進位檔，確認 `apply --3way` 還原正確）
 - 衝突 fallback 的 `pause` 路徑（apply 也失敗、需完全手動解決）仍未實測 — 目前夾具的 patch 都能乾淨套用
-- patch-first 對「rename + 同時內容也改動」的組合尚未有專屬夾具（目前 rename 夾具是純改名；混合改內容的 rename 由 `--3way` fallback 處理，未驗證）
+- ~~patch-first 對「rename + 同時內容也改動」的組合尚未有專屬夾具~~（已驗證，見案例 8 `tmp/rebuild-mixedrename-001`）
 - repo 路徑含空格、`commit.gpgsign=true` 與 pre-commit/commit-msg hook、重建中斷後重跑的恢復行為
 
 ## 測試案例
@@ -79,8 +80,9 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 | 5 | `tmp/rebuild-conflict-001` | neo | 4 節點：c1 建檔 → merge side-a → **merge side-b（必然衝突，原始史手動解為 AB）** → c2 | PASS：fallback 觸發 2 次（含 replay 時因 cherry-pick 改變 merge-base 導致的 add/add 衝突），`apply --3way` 皆乾淨套用；4==4 節點、tree 相同、解法 `line3-AB` 被完整重現、合併節點保持 MERGE x2、側支 tip 可達、原合併脫離。**實測發現並修復**：原 fallback 以 `add -u`+`commit` 收尾會把合併退化成單親（側支失聯），已改 `write-tree`+`commit-tree` |
 | 6 | `tmp/rebuild-cjk-001` | neo | 4 節點：CJK 訊息/檔名/內容 → 合併 **CJK 分支名** `tmp/中文側支-001` → CJK 追加 → 合併 `tmp/cjk-side-2` | PASS：CJK commit 訊息（cherry-pick 與 merge 兩路徑）、中文檔名、中文內容、CJK 側支分支名全保留；subjects 逐位元相同、tree 相同、側支 tip 可達、原合併脫離 |
 | 7 | `tmp/rebuild-rename-001` | neo | 4 節點：c1 → merge side-a（純改名 → moved.txt）→ **merge side-b（rename/rename 衝突，手動保留 moved.txt）** → c2 | PASS（patch-first 修復後）：4==4 節點、tree 完全相同 `4111f4cb`、側支 tip 可達、原合併脫離。side-a 走 `git apply --index` 正確重現 rename（不再被 merge-base 斷裂破壞）；side-b 空 patch 走內容中立 `commit-tree`、不碰內容 |
-| 8 | 空範圍守衛 | neo | `neo neo` 與 `neo 0c388f8b`（feature 已含於 base） | PASS：皆印 `Nothing to rebuild`、exit 0 |
-| 9 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
+| 8 | `tmp/rebuild-mixedrename-001` | neo | 3 節點：c1 建檔 → **merge side（rename + 改內容在同一提交，63% similarity 帶 hunk 的 rename patch）** → c2 | PASS：3==3 節點、tree 完全相同、rename 與內容改動都保留（`mixfile-renamed.txt` 且 line3-CHANGED）、側支 tip 可達、原合併脫離。確認 patch-first 的 `git apply --index` 能處理「rename 且帶內容 hunk」的 patch |
+| 9 | 空範圍守衛 | neo | `neo neo` 與 `neo 0c388f8b`（feature 已含於 base） | PASS：皆印 `Nothing to rebuild`、exit 0 |
+| 10 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
 
 夾具設計要點：
 
