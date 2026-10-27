@@ -16,6 +16,7 @@
 | `rebuild-neo-tests/build-rename-001.ps1` | 夾具分支 `tmp/rebuild-rename-001` 建構腳本（純改名 + rename/rename 衝突，記錄已知限制） |
 | `rebuild-neo-tests/build-mixedrename-001.ps1` | 夾具分支 `tmp/rebuild-mixedrename-001` 建構腳本（rename + 內容改動在同一合併） |
 | `rebuild-neo-tests/build-manual-001.ps1` | 夾具分支 `tmp/rebuild-manual-001` 建構腳本（base 前移造成 context 漂移，唯一能觸發 `pause` 全手動路徑的夾具） |
+| `rebuild-neo-tests/build-binary-001.ps1` | 夾具分支 `tmp/rebuild-binary-001` 建構腳本（fallback 帶二進位 payload，驗證 `--binary`） |
 
 ## 工作流程
 
@@ -36,7 +37,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 ## 版本狀態
 
-**ps1 最後更新：2026-08-27（本次收尾：pause 全手動路徑實測 + 錯誤訊息改進 + 含空格 PatchDir 驗證）**
+**ps1 最後更新：2026-08-27（本次收尾：--binary 實測通過，無 ps1 改動）**
 
 已實作：
 
@@ -66,7 +67,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 待辦（未來可參考）：
 
-- **`--binary` 實測**：`git diff --binary` 已加入但尚未用含二進位檔的衝突夾具驗證（需在夾具中放一個兩側都改的二進位檔，確認 `apply --3way` 還原正確）
+- ~~`--binary` 實測~~（已驗證，見案例 14 `tmp/rebuild-binary-001`）
 - ~~衝突 fallback 的 `pause` 路徑~~（已實測，見案例 11 `tmp/rebuild-manual-001`）
 - ~~patch-first 對「rename + 同時內容也改動」的組合尚未有專屬夾具~~（已驗證，見案例 8）
 - ~~preflight 守衛（髒工作樹／進行中操作）~~（已實測，見案例 10）
@@ -94,6 +95,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 | 11 | `tmp/rebuild-manual-001` | ad607938→**neo** | 3 節點：c1 → merge side（改 PIPELINE_PATHS 同一行）→ c2；重建到**較新的** neo 觸發三重條件 | PASS：三條件全中（`apply --index` context drifted → `git merge` 衝突 → `apply --3way` 失敗 → **Pausing** 正確抵達）。非互動下 write-tree 失敗 → 改進後訊息列出 unmerged 檔 + `git add -u` + `git reset --hard HEAD` 復原指引；重跑 preflight 守衛正確擋下 `UU` 狀態 |
 | 12 | 路徑含空格 | neo | `-PatchDir '.git/rebuild patches'`（含空格目錄）對 `tmp/rebuild-conflict-001` 乾跑+實跑 | PASS：`git diff --output=<含空格路徑>` 正確寫入、`git apply --index <含空格路徑>` 正確套用、tree 完全相符；dry-run 正確印出含空格路徑且不建立目錄。證明 PowerShell 陣列 splatting 把含空格路徑當單一參數傳給 git |
 | 13 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
+| 14 | `tmp/rebuild-binary-001` | ad607938→**neo** | 4 節點：c1 建文字+二進位 v1 → c2 → **merge side（二進位 v2 + 改 PIPELINE 同一行）** → c3；重建到較新的 neo 觸發 drift→fallback | PASS：`git diff --binary` 產生含 `GIT binary patch` payload 的 patch；`apply --3way` 對二進位回 `Applied patch 'rebuildpayload.dat' cleanly`（文字檔才是 `with conflicts`）、工作目錄還原 v2；finish（write-tree+commit-tree）保留暫存二進位（blob `032c6bee`=v2）。`Pausing` 由文字衝突觸發，與二進位無關 |
 
 夾具設計要點：
 
