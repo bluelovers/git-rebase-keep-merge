@@ -37,7 +37,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 ## 版本狀態
 
-**ps1 最後更新：2026-08-27（本次收尾：未提交變更/未追蹤檔不再拒絕執行，改 stash 保護）**
+**ps1 最後更新：2026-08-27（本次收尾：停車改為「遇到時才處理」— 僅停真碰撞的未追蹤檔）**
 
 已實作：
 
@@ -59,12 +59,14 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 - **patch-first 重放（本次改動，修復 rename 內容分歧）**：合併節點改為先 `git apply --index` 套用第一父 patch（`diff P1..M`，即該合併對主線的內容貢獻定義、context 最嚴格）；只有 context 過期（跨版本，如 Mneo 佈局）才退回 `git merge --no-ff`，merge 衝突再走 `apply --3way`。**根因**：主線 cherry-pick 改了 hash → `git merge` 的 `merge-base(重放主線, 側支)` 退回更早祖先、無從偵測 rename → 靜默 add/add 把新舊路徑都留下且不觸發 fallback → 分歧；`git apply` 用第一父 blob 當基準能正確重現 rename。空 patch（內容中立合併，如 rename/rename 手動解）則直接 `commit-tree` 建節點、不碰內容
 
 - **preflight 守衛後的衝突復原指引（本次新增）**：`pause` 後若未解決（非互動／stdin 重導向下立即返回），`write-tree` 失敗改為偵測 unmerged 路徑並印出明確復原步驟（列出未合併檔 → `git add -u` → `git reset --hard HEAD` 捨棄重跑），不再只印技術性 `index not in a committable state`
-- **未提交變更／未追蹤檔不再拒絕執行（本次改動）**：改用 stash 機制 — 起跑時把**已追蹤**的未提交變更（含 staged）`git stash push`，主體包進 `try{...}finally{...}` 結束時 `git stash pop --index` 還原（`finally` 在 `exit` 時仍執行、保留退出碼，實測驗證）。這樣變更既**不被拒絕**、也**不進 commit**（write-tree 只寫索引，暫存變更已 stash 離開）、更**不遺失**。未追蹤檔留原地（cherry-pick/merge/write-tree 從不暫存它們 → 不可能被提交；撞名=衝突，屬允許的例外）。finally 的 pop 失敗分兩種成因給對應指引：(a) pop **前**索引就有 unmerged（重建停在衝突中）→ 先修索引再 pop；(b) pop 前索引乾淨、pop 才衝突（stash 與重建改到同幾行）→ 真內容衝突。dry-run 不建立 stash、只印計畫。
+- **未提交變更／未追蹤檔不再拒絕執行（前次改動）**：已追蹤的未提交變更（含 staged）`git stash push` 保存，主體包進 `try{...}finally{...}` 結束時 `git stash pop --index` 還原（`finally` 在 `exit` 時仍執行、保留退出碼，實測驗證）。變更既**不被拒絕**、也**不進 commit**（write-tree 只寫索引，暫存變更已 stash 離開）、更**不遺失**。finally 的 pop 失敗分兩種成因給對應指引：(a) pop **前**索引就有 unmerged（重建停在衝突中）→ 先修索引再 pop；(b) pop 前索引乾淨、pop 才衝突（stash 與重建改到同幾行）→ 真內容衝突。dry-run 不建立 stash、只印計畫。
+- **未追蹤檔碰撞停車機制「遇到時才處理」（前次無差別、本次改為精準交集）**：實測確認 git 對未追蹤檔與 checkout/cherry-pick 碰撞**一律硬拒絕且不看內容是否相同**（同內容也拒、本地檔不銷毀、`stash -u` 還原不可靠）→ 殘留檔（切換/撤銷遺留、先行複製）會直接中斷重建。**停車集 = 未追蹤檔 ∩（base tree 路徑 ∪ `base..feature` 全部提交的 name-only 路徑）** — 即只停「checkout 寫 base 內容」與「重放 cherry-pick/merge/apply 寫範圍內路徑」真正會撞的檔；已枚舉腳本全部寫工作樹命令（checkout/cherry-pick/merge/apply/reset --hard/stash，後兩者只動 tracked）確認交集覆蓋完整，查詢全用穩定格式（porcelain / ls-tree / log --name-only）不解析易變錯誤訊息；**若預測有漏，退化為 git 明確拒絕（不會靜默）**。其餘未追蹤檔全程原地不動（`N other untracked file(s) do not collide - left in place`）。`finally` 歸還規則不變 — 路徑空→靜默歸位；**內容相同→丟停車副本**（無縫）；**內容不同→保留停車副本+警告**（worktree 留重建版，殘留永不混入未來 `git commit -a`，附 `git diff --no-index` 比對指令）。停車撞位（同路徑已有前次停車副本）：同內容→釋放路徑、異內容→唯一後綴 `.parkedN` + manifest `原路徑 => 停車路徑` 映射，兩份都保留。任何停車失敗 → 寫完 manifest 硬退。還原逐條 try/catch、刪除失敗降級 .NET API、計數失實不刪 manifest、manifest 自身不計入殘留掃描 — 皆為實測暴露的孤兒檔 bug 修復。**附帶修正：Content check MISMATCH 現在 exit 1**。dry-run 只印 would-park 計畫。
 - **`pause` 全手動路徑實測通過**：用 base 前移夾具湊齊三重條件（patch context 漂移 + `git merge` 衝突 + `apply --3way` 失敗）→ 正確抵達 `Pausing: resolve conflicts...`；重跑時 preflight 守衛正確擋下未解決的 `UU` 狀態
 
 已知限制：
 
-- 目前無已知會產生錯誤內容的案例（rename 已修）。內容安全網仍保留作為防線：若未來任何 replay 產生與原史不同的 tree 會主動警告
+- 目前無已知會產生錯誤內容的案例（rename 已修）。內容安全網仍保留作為防線：若未來任何 replay 產生與原史不同的 tree 會主動警告，**且現在會 exit 1**（不再謊報成功）
+- **被 .gitignore 忽略的檔案不停車**（停車只掃 status 可見的 `??`）：若某忽略檔恰與「base 才追蹤」的路徑碰撞，git 的行為未驗證 — 本輪需求（切換殘留／先行複製的未追蹤檔）已完整覆蓋，忽略檔屬另一類，尚未實測
 
 待辦（未來可參考）：
 
@@ -100,6 +102,13 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 | 15 | 未提交變更／未追蹤檔 | neo | staged（`M  LICENSE`）+ unstaged（` M launch.py`）+ 未追蹤檔，對 `mixed-001` 實跑 | PASS：不拒絕、EXIT=0、`stash push → 重建 → stash pop --index` 全流程；`git log -S` 兩個標記查無 → **變更未進任何 commit**；還原後 staged 保持 staged、unstaged 保持 unstaged；未追蹤檔存在且未動；tree 仍與 source 完全相同 |
 | 16 | stash 失敗分支 | neo | (a) `manual-001` 讓重建停在自身衝突 (b) 改 `processing.py` 尾端與重建同區 → pop 衝突 | PASS：(a) exit 1、pop 前偵測索引有 unmerged → 訊息「rebuild STOPPED」+ 先修索引再 pop、stash 保留；(b) 重建成功、索引乾淨、pop 衝突 → 訊息「CONFLICT with rebuilt content」、stash 保留。**修正前** (b) 被誤判成 (a)（pop 自身留 unmerged），改為 **pop 前**檢查索引後正確分流 |
 | 17 | dry-run + 髒工作樹 | neo | staged + unstaged 變更下乾跑 | PASS：不建立 stash（只印 would stash 計畫）、EXIT=0、變更完整保留 |
+| 18 | git 行為基準實測 | — | T1/T2：cherry-pick 建路徑時本地已有未追蹤檔（同內容 vs 異內容）；T3：checkout 同情境；T4：`stash -u` pop 在路徑變已追蹤時 | **基準確認**（決定停車設計的依據）：git 對碰撞**一律硬拒絕、不比對內容**（同內容照樣 `would be overwritten` → fatal）、本地檔不銷毀；`stash -u` pop 即使用戶相同也**整體失敗**（stash 保留）→ `stash -u` 方案出局 |
+| 19 | 殘留檔停車（重建創建路徑） | neo | 殘留檔在 `mixed-001` c1 創建的路徑、內容不同；(b) 同內容版本 | PASS：(a) EXIT=0（此前 git 必拒）、worktree 留重建版、殘留停車保存、`git log -S` 證明**未進 commit**、tree 相同、`LEFTOVER CONFLICT` 含停車位置+`git diff --no-index` 指引；(b) 同內容 → 無縫丟停車副本（目錄清空） |
+| 20 | 停車污染重跑 + 殘留自癒 | neo | (a) 前次停車副本仍在時同路徑建異內容檔重跑；(b) `manual-001` 失敗路徑（exit 1）+ 前次未解停車條目 | PASS：(a) 唯一後綴 `.parked2` 停車+映射、兩份殘留都保存、tree IDENTICAL（**修復前**：停車失敗→cherry-pick 被拒→pause 靜默跳過→c1..c5 全丟、tree MISMATCH 卻 exit 0 謊報）；(b) exit 1 下 finally 歸還本次停車、前次條目自動重試（manifest 保留） |
+| 21 | checkout 碰撞殘留（舊分支起跑） | ad607938→neo | 停在舊錨點分支，殘留在「neo 才新增」的路徑（`moss_image.py`） | PASS：EXIT=0（T3 基準證明原生 checkout 必拒）、停車→重建→歸還流程完整、`LEFTOVER CONFLICT` 指引、manifest 保留未解條目。**實測暴露並修復 4 個 bug**：Remove-Item NullRef 仍計入成功→孤兒檔、manifest 刪除未驗目錄空、殘留掃描把 manifest 自身算入（自我循環）、逐條異常跳過其餘條目 → 全改真實計數+try/catch+刪除降級 .NET API+安全網掃描 |
+| 22 | dry-run + 殘留檔 | neo | 有未追蹤殘留乾跑 | PASS：只印 `would park` 計畫、檔案未移動、leftovers 目錄未建、exit 0 |
+| 23 | 全夾具回歸（停車機制後） | neo | 7 夾具（mixed/Mneo/conflict/CJK/edge/rename/mixedrename） | PASS：全部 exit=0 且 `Content check matches exactly`（停車/還原不影響任何既有行為） |
+| 24 | 遇到時才處理（交集停車） | neo | (A)只有不碰撞的未追蹤檔 (B)殘留在會碰撞路徑＋共存不碰撞檔 (C)舊分支+base tree 路徑殘留 (D)乾跑 | PASS：(A) 10 檔全不碰撞 → **零移動、leftovers 目錄不建**、訊息 `none collide - left in place`；(B) **僅** `rebuild-mixed-test.txt` 停車、其餘 10 檔原地（外科式）、LEFTOVER CONFLICT+tree 相同；(C) **僅** `moss_image.py`（base tree 集）、EXIT=0（T3 基準原生必拒）、tree 相同；(D) 只印 would-park、檔案未動。**＋7 夾具回歸全綠 exit=0** |
 
 夾具設計要點：
 

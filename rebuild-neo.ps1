@@ -179,9 +179,10 @@ $absolutePatchPath = if ([System.IO.Path]::IsPathRooted($PatchDir)) {
 # Stash uncommitted TRACKED changes so they can neither leak into the replay
 # (write-tree commits the INDEX - a staged file would be swept into a merge commit)
 # nor be destroyed (checkout / the drift path's reset --hard). Untracked files are
-# intentionally left in place: cherry-pick, merge and write-tree never stage them,
-# so they cannot enter the rebuilt result; if one collides with a path the replay
-# creates, git reports it as a conflict (the one allowed exception). The stash is
+# PARKED separately just before checkout (see inside the try below): git refuses any
+# checkout/cherry-pick that would overwrite an untracked path - even when the local
+# bytes are IDENTICAL to the committed ones (verified experimentally) - so leftovers
+# must be moved out of the worktree or the rebuild is rejected outright. The stash is
 # popped again in `finally`, so even an early `exit` cannot strand your changes.
 $Stashed = $false
 $TrackedChanges = Invoke-Git -Query -CommandArgs @('status', '--porcelain', '--untracked-files=no')
@@ -200,6 +201,144 @@ if ($TrackedChanges) {
 }
 
 try {
+
+# ===== Park untracked files =====
+# git hard-refuses ANY checkout/cherry-pick that would write over an untracked path -
+# even when the local bytes are IDENTICAL to the committed ones (verified experimentally;
+# git does not compare content, it just refuses and leaves the file untouched). Such
+# leftovers (from branch switches/aborts, manual copies) would otherwise abort the rebuild
+# with a misleading error. Park ALL status-visible untracked files outside the worktree for
+# the duration of the rebuild - zero collision risk, no prediction needed - and return them
+# in `finally` under content rules:
+#   - rebuild left the path free        -> moved back silently (original untracked state)
+#   - path rebuilt with IDENTICAL bytes -> parked copy dropped (seamless no-op)
+#   - path rebuilt with DIFFERENT bytes -> parked copy KEPT + warning; the worktree keeps
+#     the committed version so a leftover can never sneak into a later `git commit -a`
+# The manifest doubles as crash recovery: a killed run leaves it behind and the next run
+# both warns and re-attempts the restore.
+$leftoverDir = Join-Path (git rev-parse --git-dir) 'rebuild-neo-leftovers'
+$manifestPath = Join-Path $leftoverDir 'manifest.txt'
+$oldParked = @()
+if (Test-Path $manifestPath) {
+    $oldParked = @([System.IO.File]::ReadAllLines($manifestPath) | Where-Object { $_ })
+    if ($oldParked.Count -gt 0) {
+        Write-Host " NOTE: $($oldParked.Count) untracked file(s) are still parked from a previous (interrupted) run:" -ForegroundColor Yellow
+        $oldParked | Select-Object -First 10 | ForEach-Object { Write-Host ("       " + $_) -ForegroundColor Yellow }
+        Write-Host "       They will be re-attempted for restore when this run finishes." -ForegroundColor Yellow
+    }
+}
+
+# Encounter-based parking: ONLY untracked files the rebuild would actually WRITE get
+# parked; everything else (docs/, keys, configs, ...) is never touched. A path collides
+# when it exists untracked AND is written by one of exactly two sources:
+#   (a) the checkout of base  -> any path in base's tree (git refuses even identical
+#       bytes - verified experimentally; a '??' path is not in the index, so checkout
+#       must create it),
+#   (b) the replay            -> cherry-pick/merge/apply write exactly the paths changed
+#       by commits in base..feature; reset --hard only rewrites tracked-at-HEAD paths,
+#       which all originate from those two sets; stash push/pop never touch untracked.
+# All sources are queried in STABLE git formats (porcelain / ls-tree / log --name-only)
+# - no parsing of human-readable error messages, no locale dependence. If this
+# prediction were ever incomplete, behaviour degrades to git's clear refusal (never
+# silently) - the restore machinery below is identical for any parked set.
+$untrackedPaths = @()
+foreach ($line in (git -c core.quotepath=false status --porcelain --untracked-files=all)) {
+    # porcelain v1: '^?? path' lines are untracked (expanded to real files with -uall)
+    if ("$line" -match '^\?\? (.+)$') {
+        $rel = $Matches[1]
+        if ($rel.StartsWith('"')) { $rel = $rel.Trim('"').Replace('\"', '"') }
+        $untrackedPaths += $rel
+    }
+}
+$collisionPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+foreach ($p in (git ls-tree -r --name-only $BaseBranch)) { if ("$p") { [void]$collisionPaths.Add("$p") } }
+foreach ($p in (git log --name-only --format= "$BaseBranch..$FeatureBranch")) { if ("$p") { [void]$collisionPaths.Add("$p") } }
+$untrackedList = @($untrackedPaths | Where-Object { $collisionPaths.Contains($_) })
+$leftAlone = $untrackedPaths.Count - $untrackedList.Count
+if ($untrackedList.Count -gt 0) {
+    Write-Host " Untracked files that WOULD collide with the rebuild - parking them for the run:" -ForegroundColor Yellow
+    $untrackedList | Select-Object -First 10 | ForEach-Object { Write-Host ("       " + $_) -ForegroundColor DarkGray }
+    if ($untrackedList.Count -gt 10) { Write-Host ("       ... and " + ($untrackedList.Count - 10) + " more") -ForegroundColor DarkGray }
+    if ($leftAlone -gt 0) { Write-Host ("       ($leftAlone other untracked file(s) do not collide - left in place)") -ForegroundColor DarkGray }
+    if ($DryRun) {
+        Write-Host "  -> (dry run) would park the files above under $leftoverDir and return them at the end." -ForegroundColor DarkGray
+    } else {
+        New-Item -ItemType Directory -Force -Path $leftoverDir | Out-Null
+        $manifestLines = @($oldParked)
+        $parkFailures = @()
+        foreach ($rel in $untrackedList) {
+            $src = Join-Path (Get-Location).Path $rel
+            $dst = Join-Path $leftoverDir $rel
+            $relTrim = $rel.TrimEnd('/')   # 'docs/' -> 'docs' for suffix math
+            if (Test-Path -LiteralPath $dst) {
+                # A parked copy for this path already exists (previous run kept it, or a
+                # previous suffix parked here). Never lose either copy:
+                #   identical bytes -> the parked copy already holds them; free the path.
+                #   different bytes -> park under a unique suffix and record the mapping.
+                $dstIsDir = (Get-Item -LiteralPath $dst) -is [System.IO.Directory]
+                $srcIsDir = (Get-Item -LiteralPath $src) -is [System.IO.Directory]
+                $same = $false
+                if (-not $dstIsDir -and -not $srcIsDir) {
+                    try { $same = ((Get-FileHash -LiteralPath $src).Hash -eq (Get-FileHash -LiteralPath $dst).Hash) } catch { $same = $false }
+                }
+                if ($same) {
+                    Write-Host ('  $ Remove-Item "' + $rel + '"  # identical copy already parked') -ForegroundColor DarkGray
+                    try {
+                        Remove-Item -LiteralPath $src -Recurse -Force -ErrorAction Stop
+                        if ($manifestLines -notcontains $rel) { $manifestLines += $rel }
+                        continue
+                    } catch {
+                        $parkFailures += $rel
+                        Write-Host ("Warning: could not free '" + $rel + "': " + $_.Exception.Message) -ForegroundColor Yellow
+                        continue
+                    }
+                }
+                $n = 2
+                do {
+                    $suffixRel = $relTrim + '.parked' + $n
+                    $suffixDst = Join-Path $leftoverDir $suffixRel
+                    $n++
+                } while (Test-Path -LiteralPath $suffixDst)
+                Write-Host ('  $ Move-Item "' + $rel + '" -> "' + $suffixDst + '"  # path already parked (kept both copies)') -ForegroundColor DarkGray
+                try {
+                    $suffixParent = Split-Path $suffixDst -Parent
+                    if ($suffixParent) { New-Item -ItemType Directory -Force -Path $suffixParent | Out-Null }
+                    Move-Item -LiteralPath $src -Destination $suffixDst -ErrorAction Stop
+                    $manifestLines += ($rel + ' => ' + $suffixRel)
+                } catch {
+                    $parkFailures += $rel
+                    Write-Host ("Warning: could not park '" + $rel + "': " + $_.Exception.Message) -ForegroundColor Yellow
+                }
+            } else {
+                $dstParent = Split-Path $dst -Parent
+                if ($dstParent) { New-Item -ItemType Directory -Force -Path $dstParent | Out-Null }
+                Write-Host ('  $ Move-Item "' + $rel + '" -> "' + $dst + '"') -ForegroundColor DarkGray
+                try {
+                    Move-Item -LiteralPath $src -Destination $dst -ErrorAction Stop
+                    $manifestLines += $rel
+                } catch {
+                    $parkFailures += $rel
+                    Write-Host ("Warning: could not park '" + $rel + "' (in use?): " + $_.Exception.Message) -ForegroundColor Yellow
+                }
+            }
+        }
+        $manifestLines = @($manifestLines | Where-Object { $_ } | Select-Object -Unique)
+        if ($manifestLines.Count -gt 0) {
+            Set-Content -Path $manifestPath -Value $manifestLines -Encoding UTF8
+        }
+        if ($parkFailures.Count -gt 0) {
+            # A file we could not park stays in the worktree, where git will hard-refuse
+            # the replay (or, worse, abort commits one by one and silently corrupt the
+            # result). Fail fast BEFORE any checkout instead.
+            Write-Host "Error: could not park these untracked file(s) - the rebuild would corrupt or be rejected:" -ForegroundColor Red
+            $parkFailures | ForEach-Object { Write-Host ("       " + $_) -ForegroundColor Red }
+            Write-Host "       Close/free them (file locks?) and re-run. Everything already parked was restored below." -ForegroundColor Red
+            exit 1
+        }
+    }
+} elseif ($leftAlone -gt 0) {
+    Write-Host " $leftAlone untracked file(s) present, none collide with the rebuild - left in place." -ForegroundColor DarkGray
+}
 
 # -B creates the temp branch, or resets it to base when -f is given.
 $CheckoutAction = if ($Force) { "-B" } else { "-b" }
@@ -472,6 +611,9 @@ if (Test-Ancestor $BaseBranch $FeatureBranch) {
         Write-Host "   rebuilt $rebuiltTree" -ForegroundColor Red
         Write-Host "   A merge replayed to a different result than the original (likely a" -ForegroundColor Red
         Write-Host "   hand-resolved conflict). Inspect: git diff $FeatureBranch $NewBranch" -ForegroundColor Red
+        # A wrong result must not exit 0 - automation would treat it as success.
+        Write-Host " Exiting with failure (the rebuild above must NOT be landed as-is)." -ForegroundColor Red
+        exit 1
     }
 } else {
     Write-Host ""
@@ -527,6 +669,128 @@ Write-Host "========================================" -ForegroundColor Green
             } else {
                 Write-Host "Your uncommitted changes were restored (staged state preserved)." -ForegroundColor Green
             }
+        }
+    }
+
+    # Return parked untracked files under the content rules (see the park block for the
+    # full rationale). The manifest is the source of truth, so entries from a previously
+    # KILLED run are re-attempted here too (self-healing).
+    if (Test-Path $manifestPath) {
+        Write-Host ""
+        $entries = @([System.IO.File]::ReadAllLines($manifestPath) | Where-Object { $_ })
+        $returned = 0
+        $identicalDropped = 0
+        $unresolved = @()
+        foreach ($lineSpec in $entries) {
+          try {
+            # Manifest line: '<originalRelPath>' or '<originalRelPath> => <parkedRelPath>'
+            # (the arrow form is used when a path was parked under a unique suffix because
+            # the plain location already held a previous leftover).
+            $origRel = $lineSpec
+            $parkedRel = $lineSpec
+            if ($lineSpec -match '^(.+?) => (.+)$') {
+                $origRel = $Matches[1]
+                $parkedRel = $Matches[2]
+            }
+            $src = Join-Path $leftoverDir $parkedRel      # parked copy
+            $dst = Join-Path (Get-Location).Path $origRel  # worktree location
+            if (-not (Test-Path -LiteralPath $src)) { continue }
+            if (-not (Test-Path -LiteralPath $dst)) {
+                $dstParent = Split-Path $dst -Parent
+                if ($dstParent) { New-Item -ItemType Directory -Force -Path $dstParent | Out-Null }
+                Move-Item -LiteralPath $src -Destination $dst -ErrorAction Stop
+                $returned++
+                continue
+            }
+            # Path exists again - decide by content.
+            $srcIsDir = (Get-Item -LiteralPath $src) -is [System.IO.Directory]
+            $dstIsDir = (Get-Item -LiteralPath $dst) -is [System.IO.Directory]
+            if ($srcIsDir -or $dstIsDir) {
+                $unresolved += $lineSpec
+                Write-Host ("LEFTOVER CONFLICT: '" + $origRel + "' exists in the rebuild AND was parked as a leftover (directory).") -ForegroundColor Red
+                Write-Host ("  parked copy: " + $src) -ForegroundColor Yellow
+                continue
+            }
+            $same = $false
+            try {
+                $same = ((Get-FileHash -LiteralPath $src).Hash -eq (Get-FileHash -LiteralPath $dst).Hash)
+            } catch {
+                $same = $false
+            }
+            if ($same) {
+                # Identical content: the rebuilt file IS the leftover - drop the parked copy.
+                # Removal failures must NOT be counted as success, or the manifest would be
+                # deleted while the file stays parked (orphaned with no tracking). PS5.1's
+                # Remove-Item -Force is known to throw NullReferenceException on some paths;
+                # fall back to the .NET API before giving up.
+                $droppedOk = $false
+                try {
+                    Remove-Item -LiteralPath $src -Force -ErrorAction Stop
+                    $droppedOk = $true
+                } catch {
+                    try {
+                        if ((Get-Item -LiteralPath $src) -is [System.IO.Directory]) {
+                            [System.IO.Directory]::Delete($src, $true)
+                        } else {
+                            [System.IO.File]::Delete($src)
+                        }
+                        $droppedOk = $true
+                    } catch {
+                        $droppedOk = $false
+                    }
+                }
+                if ($droppedOk) {
+                    $identicalDropped++
+                } else {
+                    $unresolved += $lineSpec
+                    Write-Host ("Warning: could not delete identical parked copy '" + $origRel + "'; kept for retry.") -ForegroundColor Yellow
+                }
+            } else {
+                $unresolved += $lineSpec
+                Write-Host ("LEFTOVER CONFLICT: '" + $origRel + "' differs from the rebuilt file at the same path.") -ForegroundColor Red
+                Write-Host ("  worktree keeps the REBUILT version; your leftover is parked at:") -ForegroundColor Yellow
+                Write-Host ("    " + $src) -ForegroundColor Yellow
+                Write-Host ("  Compare:  git diff --no-index `"" + $src + "`" `"" + $dst + "`"") -ForegroundColor Yellow
+                Write-Host ("  To use your leftover, copy it over (it becomes an uncommitted change);") -ForegroundColor Yellow
+                Write-Host ("  otherwise delete the parked copy when you're done.") -ForegroundColor Yellow
+            }
+          } catch {
+            # One entry must never abort (or silently skip) the rest - keep it tracked.
+            $unresolved += $lineSpec
+            Write-Host ("Warning: error while returning '" + $lineSpec + "': " + $_.Exception.Message) -ForegroundColor Yellow
+          }
+        }
+        # Summary + manifest bookkeeping
+        $notes = @()
+        if ($returned -gt 0) { $notes += "$returned returned unchanged" }
+        if ($identicalDropped -gt 0) { $notes += "$identicalDropped identical leftover(s) dropped (rebuilt file kept)" }
+        if ($notes.Count -gt 0) {
+            Write-Host ("Untracked leftovers: " + ($notes -join '; ') + ".") -ForegroundColor Green
+        }
+        # Manifest bookkeeping - never drop tracking while anything stays parked:
+        # a manifest deleted over leftover files would orphan them invisibly.
+        if ($unresolved.Count -eq 0) {
+            # Exclude the manifest file itself - it lives inside leftoverDir and would
+            # otherwise be counted as a phantom residual (self-perpetuating forever).
+            $manifestFull = [System.IO.Path]::GetFullPath($manifestPath)
+            $residuals = @(Get-ChildItem -LiteralPath $leftoverDir -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -ne $manifestFull })
+            if ($residuals.Count -eq 0) {
+                Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
+                if (-not (Get-ChildItem -LiteralPath $leftoverDir -Force -ErrorAction SilentlyContinue)) {
+                    Remove-Item -LiteralPath $leftoverDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            } else {
+                $rootLen = (Resolve-Path -LiteralPath $leftoverDir).Path.Length
+                $residualLines = @($residuals | ForEach-Object {
+                    ($_.FullName.Substring($rootLen).TrimStart('\', '/')) -replace '\\', '/'
+                } | Select-Object -Unique)
+                Set-Content -Path $manifestPath -Value $residualLines -Encoding UTF8
+                Write-Host "Warning: $($residualLines.Count) parked file(s) could not be resolved this run;" -ForegroundColor Yellow
+                Write-Host "         manifest kept so the next run re-attempts their restore." -ForegroundColor Yellow
+            }
+        } else {
+            Set-Content -Path $manifestPath -Value $unresolved -Encoding UTF8
         }
     }
 }
