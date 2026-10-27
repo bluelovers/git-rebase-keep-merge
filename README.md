@@ -12,6 +12,8 @@
 | `rebuild-neo-tests/build-mixed-neo-001.ps1` | 夾具分支 `tmp/rebuild-mixed-neo-001` 建構腳本（base=ad607938，含中段合併 neo） |
 | `rebuild-neo-tests/build-edge-001.ps1` | 夾具分支 `tmp/rebuild-edge-001` 建構腳本（單親 Merge 訊息、空提交、octopus） |
 | `rebuild-neo-tests/build-conflict-001.ps1` | 夾具分支 `tmp/rebuild-conflict-001` 建構腳本（必然衝突，含手動解決步驟） |
+| `rebuild-neo-tests/build-cjk-001.ps1` | 夾具分支 `tmp/rebuild-cjk-001` 建構腳本（CJK 訊息／檔名／分支名） |
+| `rebuild-neo-tests/build-rename-001.ps1` | 夾具分支 `tmp/rebuild-rename-001` 建構腳本（純改名 + rename/rename 衝突，記錄已知限制） |
 
 ## 工作流程
 
@@ -32,7 +34,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 ## 版本狀態
 
-**ps1 最後更新：2026-08-27（本次收尾：衝突 fallback 實測並修復結構退化）**
+**ps1 最後更新：2026-08-27（本次收尾：CJK 實測通過 + rename 已知限制記錄 + 新增內容安全網）**
 
 已實作：
 
@@ -49,12 +51,19 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 - **空範圍守衛**：base==feature 或 feature 已含於 base 時印 `Nothing to rebuild` 並 exit 0，不再誤印 completed
 - **空提交**：cherry-pick 前用 `git diff --quiet` 偵測，空提交自動加 `--allow-empty`
 - **衝突 fallback 收尾改為真合併結構**（本次實測發現原 `add -u` + `commit` 會把合併節點退化成單親 commit、側支 tip 失聯）：現為 `write-tree` + `commit-tree -p HEAD -p <targets>` + `reset --hard`，節點保持 MERGE 且側支 tip 可達；`apply --3way` 失敗時暫停，提示手動解決並 `git add -u` 後繼續，同一段 commit-tree 邏輯收尾
+- **CJK 驗證通過**：中文 commit 訊息（cherry-pick 與 merge 兩條路徑）、中文檔名與內容、含 CJK 的側支分支名（`tmp/中文側支-001`）全部完整保留，subjects 逐位元相同
+- **內容安全網**（本次新增）：replay 用 `git merge` 重新自動合併，**不保證重現原始手動解決的衝突**（patch fallback 只在 replay 衝突時觸發；若 replay 乾淨卻與原史不同 → 靜默腐蝕）。當 base 是 feature 的祖先時（可證明 tree 應完全相符），結尾比對 `rev-parse <feature>^{tree}` vs `<temp>^{tree}`，不符就印紅字 MISMATCH 與檢查指令；異基底重建（base 已前移）自動略過
+
+已知限制（rename 夾具實測記錄）：
+
+- **rename/rename 衝突 + 手動解決**：兩側把同一檔案改名成不同名字，原史是衝突、手動保留其中一個（淨內容變化 = 0 → patch 為空）。replay 時 merge-base 相同卻可能乾淨合併（git 自動保留兩個改名）→ fallback 不觸發 → 手動的刪除被忽略 → tree 分歧。此時安全網會印 MISMATCH 提示人工檢查；尚無自動修復方案（本質上需要把原始衝突解決也記錄成 patch，是下一步可能的改進方向）
 
 待辦（未來可參考）：
 
 - **`--binary` 實測**：`git diff --binary` 已加入但尚未用含二進位檔的衝突夾具驗證（需在夾具中放一個兩側都改的二進位檔，確認 `apply --3way` 還原正確）
 - 衝突 fallback 的 `pause` 路徑（apply 也失敗、需完全手動解決）仍未實測 — 目前夾具的 patch 都能乾淨套用
-- CJK commit 訊息／分支名（`-m` 編碼鏈）、repo 路徑含空格、`commit.gpgsign=true` 與 pre-commit/commit-msg hook、rename／檔案模式變更穿過 merge 與 fallback、重建中斷後重跑的恢復行為
+- rename/rename 已知限制的自動修復（把原始 merge 的衝突解決區塊記錄下來，replay 時強制套用）
+- repo 路徑含空格、`commit.gpgsign=true` 與 pre-commit/commit-msg hook、重建中斷後重跑的恢復行為
 
 ## 測試案例
 
@@ -66,9 +75,11 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 | 2 | `tmp/rebuild-mixed-001` | neo | 10 節點：5 一般提交與 5 PR 合併交錯，c3/c4 夾擊 processing.py，含連續合併 | PASS：tree `d4017e5f` 相同、patch-id `33ff575e…` 相同、5 原 merge 全脫離、5 feature tip 全為祖先、訊息未加 (Rebuilt)、原分支未動 |
 | 3 | `tmp/rebuild-mixed-neo-001` | ad607938 | 17 節點：c1..c8 → **Mneo(#9，帶入 44 檔/498,672 行)** → 5 PR 合併 + c9/c10 夾擊 processing.py → c11 | PASS：tree `93e7b61d` 完全相同、`git diff 來源 重建` 為空、4 個跨版本 cherry-pick 全乾淨；方案 (b) 修復後 **17==17 節點 1:1**，Mneo 以空合併 commit 保留、原 Mneo 仍脫離、neo tip 為真第二父 |
 | 4 | `tmp/rebuild-edge-001` | neo | 5 節點：一般提交 → 單親 "Merge remote-tracking..." 訊息 → 空提交 → **octopus 合併 3 側支** → 一般提交 | PASS：5==5 節點、tree 相同、訊息逐行相同；單親 Merge 訊息正確走 cherry-pick 且脫離原提交、空提交以 `--allow-empty` 保留、octopus 重放為 MERGE x4 且 3 個側支 tip 全為祖先 |
-| 5 | 空範圍守衛 | neo | `neo neo` 與 `neo 0c388f8b`（feature 已含於 base） | PASS：皆印 `Nothing to rebuild`、exit 0 |
-| 6 | `tmp/rebuild-conflict-001` | neo | 4 節點：c1 建檔 → merge side-a → **merge side-b（必然衝突，原始史手動解為 AB）** → c2 | PASS：fallback 觸發 2 次（含 replay 時因 cherry-pick 改變 merge-base 導致的 add/add 衝突），`apply --3way` 皆乾淨套用；4==4 節點、tree 相同、解法 `line3-AB` 被完整重現、合併節點保持 MERGE x2、側支 tip 可達、原合併脫離。**實測發現並修復**：原 fallback 以 `add -u`+`commit` 收尾會把合併退化成單親（側支失聯），已改 `write-tree`+`commit-tree` |
-| 7 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
+| 5 | `tmp/rebuild-conflict-001` | neo | 4 節點：c1 建檔 → merge side-a → **merge side-b（必然衝突，原始史手動解為 AB）** → c2 | PASS：fallback 觸發 2 次（含 replay 時因 cherry-pick 改變 merge-base 導致的 add/add 衝突），`apply --3way` 皆乾淨套用；4==4 節點、tree 相同、解法 `line3-AB` 被完整重現、合併節點保持 MERGE x2、側支 tip 可達、原合併脫離。**實測發現並修復**：原 fallback 以 `add -u`+`commit` 收尾會把合併退化成單親（側支失聯），已改 `write-tree`+`commit-tree` |
+| 6 | `tmp/rebuild-cjk-001` | neo | 4 節點：CJK 訊息/檔名/內容 → 合併 **CJK 分支名** `tmp/中文側支-001` → CJK 追加 → 合併 `tmp/cjk-side-2` | PASS：CJK commit 訊息（cherry-pick 與 merge 兩路徑）、中文檔名、中文內容、CJK 側支分支名全保留；subjects 逐位元相同、tree 相同、側支 tip 可達、原合併脫離 |
+| 7 | `tmp/rebuild-rename-001` | neo | 4 節點：c1 → merge side-a（純改名 → moved.txt）→ **merge side-b（rename/rename 衝突，手動保留 moved.txt）** → c2 | **MISMATCH（已知限制）**：4==4 節點、側支 tip 可達、原合併脫離，但 tree 差 `other-name.txt`。根因：原手動解決淨變化=0（patch 為空），replay 時 merge-base 相同卻乾淨合併（git 保留兩個改名）→ fallback 不觸發 → 手動刪除被忽略。安全網正確印出 MISMATCH。純改名（side-a）本身 replay 正確（rename 100% 保留） |
+| 8 | 空範圍守衛 | neo | `neo neo` 與 `neo 0c388f8b`（feature 已含於 base） | PASS：皆印 `Nothing to rebuild`、exit 0 |
+| 9 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
 
 夾具設計要點：
 

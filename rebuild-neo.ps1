@@ -358,6 +358,34 @@ if ($DryRun) {
     exit 0
 }
 
+# Final safety net: replaying a merge re-runs git's auto-merge, which is NOT guaranteed to
+# reproduce a hand-resolved conflict from the original history (the patch fallback only
+# fires when the replay conflicts; if the replay auto-merges cleanly to a DIFFERENT result,
+# content silently diverges). When base is a strict ancestor of the feature branch, replaying
+# base..feature onto base must reproduce the source tree exactly - so verify it and shout if
+# not. When base is NOT an ancestor (base moved ahead of where the feature forked), the trees
+# may legitimately differ, so we skip the check.
+$srcTree = $null
+$rebuiltTree = $null
+if (Test-Ancestor $BaseBranch $FeatureBranch) {
+    $srcTree = (Invoke-Git -Query -CommandArgs @('rev-parse', "$FeatureBranch^{tree}")) -join ''
+    $rebuiltTree = (Invoke-Git -Query -CommandArgs @('rev-parse', "$NewBranch^{tree}")) -join ''
+    Write-Host ""
+    if ($srcTree -eq $rebuiltTree) {
+        Write-Host " Content check: rebuilt tree matches source tree exactly ($($srcTree.Substring(0,8)))." -ForegroundColor Green
+    } else {
+        Write-Host " Content check: MISMATCH - rebuilt tree differs from source tree!" -ForegroundColor Red
+        Write-Host "   source  $srcTree" -ForegroundColor Red
+        Write-Host "   rebuilt $rebuiltTree" -ForegroundColor Red
+        Write-Host "   A merge replayed to a different result than the original (likely a" -ForegroundColor Red
+        Write-Host "   hand-resolved conflict). Inspect: git diff $FeatureBranch $NewBranch" -ForegroundColor Red
+    }
+} else {
+    Write-Host ""
+    Write-Host " Content check skipped: '$BaseBranch' is not an ancestor of '$FeatureBranch'," -ForegroundColor DarkGray
+    Write-Host " so the rebuilt and source trees are allowed to differ (base moved ahead)." -ForegroundColor DarkGray
+}
+
 Write-Host "`n========================================" -ForegroundColor Green
 Write-Host " Rebuild completed!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Yellow
