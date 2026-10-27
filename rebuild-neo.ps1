@@ -274,31 +274,91 @@ foreach ($c in $commits) {
             Write-Host "  -> Patch extracted safely: $patchPath" -ForegroundColor DarkYellow
         }
 
-        Write-Host "  -> Re-running git merge --no-ff (feature tip(s), detached from original merges)..." -ForegroundColor Yellow
-        # Replay every side parent in one merge command: keeps the node an octopus merge
-        # (1:1 node mapping) and nothing is lost. If any pair conflicts, git aborts the
-        # whole octopus and the patch fallback below recovers the content.
-        Invoke-Git -CommandArgs (@('merge', '--no-ff') + $sideParents + @('-m', $commitMessage))
-
-        if ($DryRun) {
-            Write-Host "  -> (dry run) command printed above, not executed." -ForegroundColor DarkGray
-        } elseif ($LASTEXITCODE -ne 0) {
-            Write-Host "  -> Conflict detected! Falling back to patch application..." -ForegroundColor Yellow
-
-            Invoke-Git -CommandArgs @('merge', '--abort')
-            Invoke-Git -CommandArgs @('apply', '--3way', '--index', $targetPatchFile)
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "  -> Patch could not apply cleanly. Pausing: resolve conflicts in the working tree," -ForegroundColor Red
-                Write-Host "  ->    stage the result with 'git add -u', then press any key to continue..." -ForegroundColor Red
-                pause
-            } else {
-                Write-Host "  -> Patch applied successfully! Finishing as a real merge commit..." -ForegroundColor Green
+        # An EMPTY patch means the original merge was content-neutral: its tree equalled its
+        # first parent's (e.g. a rename/rename conflict resolved by hand to drop everything the
+        # side branch added). Replaying such a node must ALSO be content-neutral. `git merge`
+        # would recompute a different merge-base and could auto-merge to a DIFFERENT tree
+        # (e.g. keeping a rename the original hand-deleted), silently diverging - and the
+        # empty patch can't be applied as a fallback either. So short-circuit: build the merge
+        # node directly with commit-tree, using the CURRENT tree (no content change) and every
+        # side parent. Deterministic, no divergence possible.
+        if (-not $DryRun -and (Get-Item $targetPatchFile).Length -eq 0) {
+            Write-Host "  -> Empty patch: original merge was content-neutral. Building the merge node without re-merging content." -ForegroundColor Yellow
+            $curTree = (Invoke-Git -Query -CommandArgs @('rev-parse', 'HEAD^{tree}')) -join ''
+            $ctArgs = @('commit-tree', "$curTree".Trim(), '-p', 'HEAD')
+            foreach ($t in $sideParents) { $ctArgs += @('-p', $t) }
+            $ctArgs += @('-m', $commitMessage)
+            $newCommit = Invoke-Git -Capture -CommandArgs $ctArgs
+            if ($LASTEXITCODE -ne 0 -or "$newCommit" -notmatch '^[0-9a-f]{7,40}$') {
+                Write-Host "  -> Error: commit-tree failed for content-neutral merge of $hash" -ForegroundColor Red
+                exit 1
             }
+            $newCommit = "$newCommit".Trim()
+            Invoke-Git -CommandArgs @('reset', '--hard', $newCommit)
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "  -> Error: failed to attach the content-neutral merge commit $newCommit" -ForegroundColor Red
+                exit 1
+            }
+            Write-Host "  -> Content-neutral merge node created: $($newCommit.Substring(0,8)) (side parents kept, content untouched)" -ForegroundColor Green
+            continue
+        }
 
-            # Finish with write-tree + commit-tree (NOT a plain `git commit`): the node keeps
-            # its merge structure - HEAD plus every side parent - so the side tips stay
-            # reachable and the rebuilt node mapping stays 1:1. A plain commit here would
-            # silently degrade the merge into a single-parent commit.
+        # ===== Merge node replay =====
+        # Strategy: PATCH-FIRST, merge as fallback.
+        #
+        # The first-parent patch (diff P1..M) IS the merge's content contribution relative to
+        # its mainline parent - the authoritative definition of what the merge added. Applying
+        # it with `git apply --index` (strict context) is the most faithful replay and is the
+        # ONLY way to reproduce renames: because cherry-picking the mainline rewrites commit
+        # hashes, `git merge` computes a merge-base that predates the renamed file, fails to
+        # detect the rename, and silently keeps BOTH the old and new paths (content divergence
+        # that never triggers the conflict fallback). When the patch context has drifted
+        # (e.g. rebuilding onto a NEWER base, like the Mneo layout), `git apply` fails cleanly
+        # and we fall back to a real `git merge`, which can still 3-way against the new base.
+        if ($DryRun) {
+            Invoke-Git -CommandArgs @('apply', '--index', $targetPatchFile)
+            Write-Host "  -> (dry run) would try 'git apply --index' first; on drift fall back to 'git merge --no-ff'," -ForegroundColor DarkGray
+            Write-Host "     and on merge conflict to 'git apply --3way'. Nothing executed." -ForegroundColor DarkGray
+            continue
+        }
+
+        $mergedClean = $false   # true only when a real `git merge` produced its own commit
+        $appliedOK   = $false
+
+        # --- Primary: faithful patch replay (handles renames) ---
+        Invoke-Git -CommandArgs @('apply', '--index', $targetPatchFile)
+        if ($LASTEXITCODE -eq 0) {
+            $appliedOK = $true
+            Write-Host "  -> Patch applied cleanly (faithful first-parent replay)." -ForegroundColor Green
+        } else {
+            # Context drifted. `git apply` is all-or-nothing, but reset anyway so the merge
+            # below always starts from a clean tree regardless of git version behaviour.
+            Write-Host "  -> Patch context drifted (base moved?); falling back to git merge --no-ff..." -ForegroundColor Yellow
+            Invoke-Git -CommandArgs @('reset', '--hard', 'HEAD')
+            Invoke-Git -CommandArgs (@('merge', '--no-ff') + $sideParents + @('-m', $commitMessage))
+            if ($LASTEXITCODE -eq 0) {
+                $mergedClean = $true
+                Write-Host "  -> Merge completed cleanly, no conflicts." -ForegroundColor Green
+            } else {
+                Write-Host "  -> Conflict detected! Falling back to 3-way patch application..." -ForegroundColor Yellow
+                Invoke-Git -CommandArgs @('merge', '--abort')
+                Invoke-Git -CommandArgs @('apply', '--3way', '--index', $targetPatchFile)
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "  -> Patch could not apply cleanly. Pausing: resolve conflicts in the working tree," -ForegroundColor Red
+                    Write-Host "  ->    stage the result with 'git add -u', then press any key to continue..." -ForegroundColor Red
+                    pause
+                } else {
+                    Write-Host "  -> Patch applied successfully (3-way)." -ForegroundColor Green
+                }
+            }
+        }
+
+        # If the content came from a patch (primary apply OR 3-way fallback), it is staged but
+        # uncommitted: finish it as a real merge commit via write-tree + commit-tree so the node
+        # keeps its merge structure and every side parent stays reachable. A clean `git merge`
+        # already created its own commit, so we skip finishing in that case. A plain `git commit`
+        # here would silently degrade the merge into a single-parent commit.
+        if (-not $mergedClean) {
             $mergedTree = Invoke-Git -Capture -CommandArgs @('write-tree')
             if ($LASTEXITCODE -ne 0 -or "$mergedTree" -notmatch '^[0-9a-f]{7,40}$') {
                 Write-Host "  -> Error: git write-tree failed - index not in a committable state." -ForegroundColor Red
@@ -309,18 +369,16 @@ foreach ($c in $commits) {
             $ctArgs += @('-m', $commitMessage)
             $newCommit = Invoke-Git -Capture -CommandArgs $ctArgs
             if ($LASTEXITCODE -ne 0 -or "$newCommit" -notmatch '^[0-9a-f]{7,40}$') {
-                Write-Host "  -> Error: commit-tree failed while finishing the fallback merge." -ForegroundColor Red
+                Write-Host "  -> Error: commit-tree failed while finishing the patch-applied merge." -ForegroundColor Red
                 exit 1
             }
             $newCommit = "$newCommit".Trim()
             Invoke-Git -CommandArgs @('reset', '--hard', $newCommit)
             if ($LASTEXITCODE -ne 0) {
-                Write-Host "  -> Error: failed to attach the fallback merge commit $newCommit" -ForegroundColor Red
+                Write-Host "  -> Error: failed to attach the merge commit $newCommit" -ForegroundColor Red
                 exit 1
             }
-            Write-Host "  -> Fallback merge commit created: $($newCommit.Substring(0,8)) (structure preserved)" -ForegroundColor Green
-        } else {
-            Write-Host "  -> Merge completed cleanly, no conflicts." -ForegroundColor Green
+            Write-Host "  -> Merge node created: $($newCommit.Substring(0,8)) (structure preserved, side parents kept)" -ForegroundColor Green
         }
 
     } else {
