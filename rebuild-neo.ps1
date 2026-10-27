@@ -190,6 +190,17 @@ if (-not $DryRun -and $LASTEXITCODE -ne 0) {
 # --first-parent: replay only mainline nodes (merges stay merges; no double-apply of side-branch commits)
 $commits = Invoke-Git -Query -CommandArgs @('log', "$BaseBranch..$FeatureBranch", '--first-parent', '--reverse', '--oneline')
 
+# Nothing to replay: same branch, or the feature is already fully contained in base.
+# Don't fall through to a misleading "Rebuild completed!" banner.
+if (-not $commits -or @($commits).Count -eq 0) {
+    if (Test-Ancestor $FeatureBranch $BaseBranch) {
+        Write-Host "Nothing to rebuild: '$FeatureBranch' is already fully contained in '$BaseBranch'." -ForegroundColor Yellow
+    } else {
+        Write-Host "Nothing to rebuild: '$BaseBranch..$FeatureBranch' has no first-parent commits." -ForegroundColor Yellow
+    }
+    exit 0
+}
+
 foreach ($c in $commits) {
     $parts = $c -split ' ', 2
     $hash = $parts[0]
@@ -200,14 +211,60 @@ foreach ($c in $commits) {
     $parentLine = (Invoke-Git -Query -CommandArgs @('rev-list', '--parents', '-n', '1', $hash)) -join ' '
     $parentCount = $parentLine.Split(' ').Length - 1
 
-    if ($parentCount -gt 1 -or $msg -match "^Merge") {
+    # A merge node is a commit with 2+ parents. The commit MESSAGE is never used as a
+    # signal: a single-parent commit whose subject starts with "Merge" (squash-style
+    # messages, "Merge remote-tracking branch ..." squashes) must stay on the
+    # cherry-pick path, otherwise merging it would drag the old history back in as an
+    # ancestor - exactly what this tool exists to prevent.
+    if ($parentCount -gt 1) {
         Write-Host "`n[Merge commit detected] $hash - $msg" -ForegroundColor Yellow
+
+        # Side parents ^2..^N (octopus merges have 3+ parents; all must be replayed or
+        # their content is silently lost).
+        $sideParents = @()
+        for ($i = 2; $i -le $parentCount; $i++) { $sideParents += "$hash^$i" }
+
+        # Case (b): every side parent is already contained in HEAD (e.g. the merge target
+        # is the base branch itself, or was brought in by an earlier replayed merge).
+        # `git merge --no-ff` would answer "Already up to date." and create NO commit,
+        # silently dropping the node. Force an empty merge commit with commit-tree so the
+        # rebuilt history keeps a 1:1 node mapping; content stays unchanged.
+        $allContained = $false
+        if (-not $DryRun) {
+            $allContained = $true
+            foreach ($t in $sideParents) {
+                if (-not (Test-Ancestor $t 'HEAD')) { $allContained = $false; break }
+            }
+        }
+
+        if ($allContained) {
+            Write-Host "  -> All merge targets already contained in HEAD; forcing an EMPTY merge commit (node preserved, content unchanged)." -ForegroundColor Yellow
+            $ctArgs = @('commit-tree', 'HEAD^{tree}', '-p', 'HEAD')
+            foreach ($t in $sideParents) { $ctArgs += @('-p', $t) }
+            $ctArgs += @('-m', $commitMessage)
+            $newCommit = Invoke-Git -Capture -CommandArgs $ctArgs
+            if ($LASTEXITCODE -ne 0 -or "$newCommit" -notmatch '^[0-9a-f]{7,40}$') {
+                Write-Host "  -> Error: commit-tree failed for empty merge of $hash" -ForegroundColor Red
+                exit 1
+            }
+            $newCommit = "$newCommit".Trim()
+            # Tree is identical to HEAD's tree, so --hard moves the branch without touching content.
+            Invoke-Git -CommandArgs @('reset', '--hard', $newCommit)
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "  -> Error: failed to attach the empty merge commit $newCommit" -ForegroundColor Red
+                exit 1
+            }
+            Write-Host "  -> Empty merge commit created: $($newCommit.Substring(0,8))" -ForegroundColor Green
+            continue
+        }
 
         $patchPath = "$PatchDir/merge-$hash.patch"
         $targetPatchFile = "$absolutePatchPath/merge-$hash.patch"
 
+        # --binary: embed binary payloads, otherwise `git apply --3way` in the conflict
+        # fallback cannot restore binary files touched by the merge.
         # git writes the patch file directly: no shell redirection, no caret escaping, no encoding corruption
-        Invoke-Git -CommandArgs @('diff', "--output=$targetPatchFile", "$hash^", $hash)
+        Invoke-Git -CommandArgs @('diff', '--binary', "--output=$targetPatchFile", "$hash^", $hash)
         if ($DryRun) {
             Write-Host "  -> (dry run) would extract patch to: $patchPath" -ForegroundColor DarkGray
         } elseif ($LASTEXITCODE -ne 0) {
@@ -217,16 +274,11 @@ foreach ($c in $commits) {
             Write-Host "  -> Patch extracted safely: $patchPath" -ForegroundColor DarkYellow
         }
 
-        Write-Host "  -> Re-running git merge --no-ff (feature tip, detached from original merges)..." -ForegroundColor Yellow
-        if ($parentCount -gt 1) {
-            # Second parent = the actual feature tip: replayed merge is structurally real,
-            # while the original merge commit never becomes an ancestor of the rebuilt branch.
-            $mergeTarget = "$hash^2"
-        } else {
-            # Message-only "Merge" node without a real second parent: merge the commit itself.
-            $mergeTarget = $hash
-        }
-        Invoke-Git -CommandArgs @('merge', '--no-ff', $mergeTarget, '-m', $commitMessage)
+        Write-Host "  -> Re-running git merge --no-ff (feature tip(s), detached from original merges)..." -ForegroundColor Yellow
+        # Replay every side parent in one merge command: keeps the node an octopus merge
+        # (1:1 node mapping) and nothing is lost. If any pair conflicts, git aborts the
+        # whole octopus and the patch fallback below recovers the content.
+        Invoke-Git -CommandArgs (@('merge', '--no-ff') + $sideParents + @('-m', $commitMessage))
 
         if ($DryRun) {
             Write-Host "  -> (dry run) command printed above, not executed." -ForegroundColor DarkGray
@@ -250,7 +302,20 @@ foreach ($c in $commits) {
 
     } else {
         Write-Host "`n[Regular commit] $hash - $msg" -ForegroundColor Cyan
-        Invoke-Git -CommandArgs @('cherry-pick', $hash)
+        # An empty commit (no file changes vs its parent) makes plain cherry-pick fail with
+        # "The previous cherry-pick is now empty"; replay it explicitly as an empty commit
+        # so the node mapping stays 1:1.
+        $isEmpty = $false
+        if (-not $DryRun) {
+            Invoke-Git -Query -CommandArgs @('diff', '--quiet', "$hash^", $hash)
+            $isEmpty = ($LASTEXITCODE -eq 0)
+        }
+        if ($isEmpty) {
+            Write-Host "  -> Empty commit detected; replaying with --allow-empty." -ForegroundColor DarkGray
+            Invoke-Git -CommandArgs @('cherry-pick', '--allow-empty', $hash)
+        } else {
+            Invoke-Git -CommandArgs @('cherry-pick', $hash)
+        }
 
         if ($DryRun) {
             Write-Host "  -> (dry run) command printed above, not executed." -ForegroundColor DarkGray

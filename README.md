@@ -10,6 +10,7 @@
 | `rebuild-neo.bat` | 啟動器（chcp 65001、轉傳 %*、失敗 pause） |
 | `rebuild-neo-tests/build-mixed-001.ps1` | 夾具分支 `tmp/rebuild-mixed-001` 建構腳本（base=neo） |
 | `rebuild-neo-tests/build-mixed-neo-001.ps1` | 夾具分支 `tmp/rebuild-mixed-neo-001` 建構腳本（base=ad607938，含中段合併 neo） |
+| `rebuild-neo-tests/build-edge-001.ps1` | 夾具分支 `tmp/rebuild-edge-001` 建構腳本（單親 Merge 訊息、空提交、octopus） |
 
 ## 工作流程
 
@@ -30,7 +31,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 ## 版本狀態
 
-**ps1 最後更新：2026-08-27 10:06（對應 T:\opencode 工作副本）**
+**ps1 最後更新：2026-08-27 11:0x（本次收尾）**
 
 已實作：
 
@@ -38,17 +39,19 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 - `rebuild/` 前綴臨時分支；自動偵測遇 `rebuild/<src>-rebuilt` 還原來源名，避免套娃並讓「already exists」守衛生效
 - banner 顯示目前分支、臨時分支、patch 目錄、dry-run/tag 模式
 - `Invoke-Git` 輔助函式（印指令、`-Query` 總是執行、`-Capture` 回傳輸出）
-- `Test-Ancestor` 輔助函式（唯讀，已加入，供後續空合併判斷使用）
+- `Test-Ancestor` 輔助函式（唯讀、會印出指令）
 - 起跑前守衛：merge / cherry-pick / rebase / revert 進行中一律拒絕；工作樹有已追蹤檔案修改一律拒絕
+- **merge 判定只看 parentCount**：單親但訊息以 "Merge" 開頭的提交走 cherry-pick，不會把舊歷史拖回祖先
+- **方案 (b) 空合併**：所有 side parent 已含於 HEAD 時，`git commit-tree HEAD^{tree} -p HEAD -p <targets>` + `reset --hard` 建空合併 commit，節點 1:1 保留（Mneo 類案例不再被靜默丟棄）
+- **octopus（3+ 父）**：`git merge --no-ff ^2 ^3 ...` 一次合併全部 side parent，保持 1:1 節點且內容不遺失
+- **patch 加 `--binary`**：衝突 fallback 的 `git apply --3way` 能還原二進位檔
+- **空範圍守衛**：base==feature 或 feature 已含於 base 時印 `Nothing to rebuild` 並 exit 0，不再誤印 completed
+- **空提交**：cherry-pick 前用 `git diff --quiet` 偵測，空提交自動加 `--allow-empty`
 
-進行中（已準備輔助函式，主迴圈尚未改）：
+仍待辦：
 
-- **方案 (b)**：合併目標已是 HEAD 祖先時，改用 `git commit-tree` 建空合併 commit 保留節點 1:1（目前會被靜默丟棄）
-- **單親 "Merge" 訊息誤判**：目前 `訊息 -match "^Merge"` 也觸發合併路徑，會把舊歷史變回祖先；應只看 parentCount
-- **octopus（3+ 父）**：目前只合併 `$hash^2`，第 3 個以後的父內容遺失
-- **patch 缺 `--binary`**：`git diff --output` 需加 `--binary`，否則含二進位檔時 `apply --3way` 必失敗
-- **`FeatureBranch == BaseBranch`**：範圍為空卻印 `Rebuild completed!`
-- **衝突 fallback 路徑從未被實測過**（三輪實跑全零衝突）：`merge --abort` → `apply --3way` → `commit` 與 `pause` 行為皆未驗證
+- **衝突 fallback 路徑從未被實測過**（目前所有測試仍零衝突）：`merge --abort` → `apply --3way` → `commit`、`--binary` 實效、`pause` 行為皆未驗證；下一個夾具應刻意製造兩分支改同一行的必然衝突
+- CJK 訊息/分支名、路徑含空格、`commit.gpgsign`/hook、rename/模式變更穿過 fallback、中斷後重跑
 
 ## 測試案例
 
@@ -58,8 +61,10 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 |---|---|---|---|---|
 | 1 | `tmp/rebuild-merge-test` | neo | 3 個 PR 合併 | PASS（tree、patch-id 相同） |
 | 2 | `tmp/rebuild-mixed-001` | neo | 10 節點：5 一般提交與 5 PR 合併交錯，c3/c4 夾擊 processing.py，含連續合併 | PASS：tree `d4017e5f` 相同、patch-id `33ff575e…` 相同、5 原 merge 全脫離、5 feature tip 全為祖先、訊息未加 (Rebuilt)、原分支未動 |
-| 3 | `tmp/rebuild-mixed-neo-001` | ad607938 | 17 節點：c1..c8 → **Mneo(#9，帶入 44 檔/498,672 行)** → 5 PR 合併 + c9/c10 夾擊 processing.py → c11 | PASS（tree `93e7b61d` 完全相同、`git diff 來源 重建` 為空、4 個跨版本 cherry-pick 全乾淨）；**發現問題**：Mneo 因 `Already up to date.` 被靜默丟棄（17→16 節點），對應上方「方案 (b)」待辦 |
-| 4 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
+| 3 | `tmp/rebuild-mixed-neo-001` | ad607938 | 17 節點：c1..c8 → **Mneo(#9，帶入 44 檔/498,672 行)** → 5 PR 合併 + c9/c10 夾擊 processing.py → c11 | PASS：tree `93e7b61d` 完全相同、`git diff 來源 重建` 為空、4 個跨版本 cherry-pick 全乾淨；方案 (b) 修復後 **17==17 節點 1:1**，Mneo 以空合併 commit 保留、原 Mneo 仍脫離、neo tip 為真第二父 |
+| 4 | `tmp/rebuild-edge-001` | neo | 5 節點：一般提交 → 單親 "Merge remote-tracking..." 訊息 → 空提交 → **octopus 合併 3 側支** → 一般提交 | PASS：5==5 節點、tree 相同、訊息逐行相同；單親 Merge 訊息正確走 cherry-pick 且脫離原提交、空提交以 `--allow-empty` 保留、octopus 重放為 MERGE x4 且 3 個側支 tip 全為祖先 |
+| 5 | 空範圍守衛 | neo | `neo neo` 與 `neo 0c388f8b`（feature 已含於 base） | PASS：皆印 `Nothing to rebuild`、exit 0 |
+| 6 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
 
 夾具設計要點：
 
