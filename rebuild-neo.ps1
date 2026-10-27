@@ -361,7 +361,20 @@ foreach ($c in $commits) {
         if (-not $mergedClean) {
             $mergedTree = Invoke-Git -Capture -CommandArgs @('write-tree')
             if ($LASTEXITCODE -ne 0 -or "$mergedTree" -notmatch '^[0-9a-f]{7,40}$') {
-                Write-Host "  -> Error: git write-tree failed - index not in a committable state." -ForegroundColor Red
+                # Most common cause: the conflict-fallback `pause` was passed without resolving
+                # and staging first (e.g. auto-run with redirected stdin), leaving unmerged paths.
+                $unmerged = git diff --name-only --diff-filter=U
+                if ($unmerged) {
+                    Write-Host "  -> Error: conflicts are still unresolved (these paths are unmerged):" -ForegroundColor Red
+                    $unmerged | ForEach-Object { Write-Host ("       " + $_) -ForegroundColor Red }
+                    Write-Host "       Resolve each file, then run: git add -u" -ForegroundColor Yellow
+                    Write-Host "       (in a live terminal the script pauses here so you can do that before it continues)" -ForegroundColor Yellow
+                } else {
+                    Write-Host "  -> Error: git write-tree failed - index is not in a committable state." -ForegroundColor Red
+                    Write-Host "       Check: git status   (then git add the resolved files and re-run)" -ForegroundColor Yellow
+                }
+                Write-Host "  -> The rebuild STOPPED mid-way on this temp branch. To abandon and retry:" -ForegroundColor Cyan
+                Write-Host "       git reset --hard HEAD   # discard partial work, then re-run with -f" -ForegroundColor Cyan
                 exit 1
             }
             $ctArgs = @('commit-tree', "$mergedTree".Trim(), '-p', 'HEAD')

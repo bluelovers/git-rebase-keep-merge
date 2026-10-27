@@ -15,6 +15,7 @@
 | `rebuild-neo-tests/build-cjk-001.ps1` | 夾具分支 `tmp/rebuild-cjk-001` 建構腳本（CJK 訊息／檔名／分支名） |
 | `rebuild-neo-tests/build-rename-001.ps1` | 夾具分支 `tmp/rebuild-rename-001` 建構腳本（純改名 + rename/rename 衝突，記錄已知限制） |
 | `rebuild-neo-tests/build-mixedrename-001.ps1` | 夾具分支 `tmp/rebuild-mixedrename-001` 建構腳本（rename + 內容改動在同一合併） |
+| `rebuild-neo-tests/build-manual-001.ps1` | 夾具分支 `tmp/rebuild-manual-001` 建構腳本（base 前移造成 context 漂移，唯一能觸發 `pause` 全手動路徑的夾具） |
 
 ## 工作流程
 
@@ -35,7 +36,7 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 ## 版本狀態
 
-**ps1 最後更新：2026-08-27（本次收尾：preflight 守衛實測通過，無 ps1 改動）**
+**ps1 最後更新：2026-08-27（本次收尾：pause 全手動路徑實測 + 錯誤訊息改進 + 含空格 PatchDir 驗證）**
 
 已實作：
 
@@ -56,6 +57,9 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 - **內容安全網**（本次新增）：replay 用 `git merge` 重新自動合併，**不保證重現原始手動解決的衝突**（patch fallback 只在 replay 衝突時觸發；若 replay 乾淨卻與原史不同 → 靜默腐蝕）。當 base 是 feature 的祖先時（可證明 tree 應完全相符），結尾比對 `rev-parse <feature>^{tree}` vs `<temp>^{tree}`，不符就印紅字 MISMATCH 與檢查指令；異基底重建（base 已前移）自動略過
 - **patch-first 重放（本次改動，修復 rename 內容分歧）**：合併節點改為先 `git apply --index` 套用第一父 patch（`diff P1..M`，即該合併對主線的內容貢獻定義、context 最嚴格）；只有 context 過期（跨版本，如 Mneo 佈局）才退回 `git merge --no-ff`，merge 衝突再走 `apply --3way`。**根因**：主線 cherry-pick 改了 hash → `git merge` 的 `merge-base(重放主線, 側支)` 退回更早祖先、無從偵測 rename → 靜默 add/add 把新舊路徑都留下且不觸發 fallback → 分歧；`git apply` 用第一父 blob 當基準能正確重現 rename。空 patch（內容中立合併，如 rename/rename 手動解）則直接 `commit-tree` 建節點、不碰內容
 
+- **preflight 守衛後的衝突復原指引（本次新增）**：`pause` 後若未解決（非互動／stdin 重導向下立即返回），`write-tree` 失敗改為偵測 unmerged 路徑並印出明確復原步驟（列出未合併檔 → `git add -u` → `git reset --hard HEAD` 捨棄重跑），不再只印技術性 `index not in a committable state`
+- **`pause` 全手動路徑實測通過**：用 base 前移夾具湊齊三重條件（patch context 漂移 + `git merge` 衝突 + `apply --3way` 失敗）→ 正確抵達 `Pausing: resolve conflicts...`；重跑時 preflight 守衛正確擋下未解決的 `UU` 狀態
+
 已知限制：
 
 - 目前無已知會產生錯誤內容的案例（rename 已修）。內容安全網仍保留作為防線：若未來任何 replay 產生與原史不同的 tree 會主動警告
@@ -63,11 +67,13 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 待辦（未來可參考）：
 
 - **`--binary` 實測**：`git diff --binary` 已加入但尚未用含二進位檔的衝突夾具驗證（需在夾具中放一個兩側都改的二進位檔，確認 `apply --3way` 還原正確）
-- 衝突 fallback 的 `pause` 路徑（apply 也失敗、需完全手動解決）仍未實測 — 目前夾具的 patch 都能乾淨套用
+- ~~衝突 fallback 的 `pause` 路徑~~（已實測，見案例 11 `tmp/rebuild-manual-001`）
 - ~~patch-first 對「rename + 同時內容也改動」的組合尚未有專屬夾具~~（已驗證，見案例 8）
 - ~~preflight 守衛（髒工作樹／進行中操作）~~（已實測，見案例 10）
 - rebase / revert 進行中守衛未單獨實測（與 merge/cherry-pick 同源 `Test-Path` 機制）
-- repo 路徑含空格、`commit.gpgsign=true` 與 pre-commit/commit-msg hook
+- ~~repo 路徑含空格~~（以含空格 `-PatchDir` 驗證，見案例 12；repo 本身路徑含空格未測 — `D:\sd-forge` 無空格）
+- `commit.gpgsign=true` 與 pre-commit/commit-msg hook
+- `pause` 在**真實互動終端**下的行為（目前用 `< /dev/null` 驗證會立即返回並給復原指引；真人按鍵前後的 staging 流程未逐格驗證）
 
 ## 測試案例
 
@@ -85,7 +91,9 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 | 8 | `tmp/rebuild-mixedrename-001` | neo | 3 節點：c1 建檔 → **merge side（rename + 改內容在同一提交，63% similarity 帶 hunk 的 rename patch）** → c2 | PASS：3==3 節點、tree 完全相同、rename 與內容改動都保留（`mixfile-renamed.txt` 且 line3-CHANGED）、側支 tip 可達、原合併脫離。確認 patch-first 的 `git apply --index` 能處理「rename 且帶內容 hunk」的 patch |
 | 9 | 空範圍守衛 | neo | `neo neo` 與 `neo 0c388f8b`（feature 已含於 base） | PASS：皆印 `Nothing to rebuild`、exit 0 |
 | 10 | preflight 守衛 | neo | ①髒已追蹤檔（`M webui.py`）②進行中 merge（`.git/MERGE_HEAD` 殘留）③進行中 cherry-pick（`CHERRY_PICK_HEAD` 殘留） | PASS：三種情形皆正確拒絕、印出明確原因與復原提示、exit 1，未動任何分支。（rebase/revert 守衛同源 `Test-Path` 機制，未單獨實測） |
-| 11 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
+| 11 | `tmp/rebuild-manual-001` | ad607938→**neo** | 3 節點：c1 → merge side（改 PIPELINE_PATHS 同一行）→ c2；重建到**較新的** neo 觸發三重條件 | PASS：三條件全中（`apply --index` context drifted → `git merge` 衝突 → `apply --3way` 失敗 → **Pausing** 正確抵達）。非互動下 write-tree 失敗 → 改進後訊息列出 unmerged 檔 + `git add -u` + `git reset --hard HEAD` 復原指引；重跑 preflight 守衛正確擋下 `UU` 狀態 |
+| 12 | 路徑含空格 | neo | `-PatchDir '.git/rebuild patches'`（含空格目錄）對 `tmp/rebuild-conflict-001` 乾跑+實跑 | PASS：`git diff --output=<含空格路徑>` 正確寫入、`git apply --index <含空格路徑>` 正確套用、tree 完全相符；dry-run 正確印出含空格路徑且不建立目錄。證明 PowerShell 陣列 splatting 把含空格路徑當單一參數傳給 git |
+| 13 | 各分支 dry-run | — | 同上 | PASS：計畫正確、零改動（分支 tip、patch 目錄、工作樹皆未變） |
 
 夾具設計要點：
 
