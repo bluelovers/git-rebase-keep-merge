@@ -227,9 +227,78 @@ if ($InProgress.Count -gt 0) {
 # Branch we started on, captured before any checkout, for display purposes.
 $StartBranch = git branch --show-current
 
+# Read-only '(@short8, ISO-8601 timestamp)' descriptor for any ref - used by the
+# branch-not-found suggestion so candidates carry hash AND the full commit moment
+# (date + time + UTC offset, e.g. 2026-10-27T09:28:23+08:00) in one line.
+function Get-RefInfo {
+    param(
+        [Parameter(Mandatory = $true)] [string]$Ref,
+        [string]$Kind = 'ref'
+    )
+    $h = (git rev-parse --short=8 "$Ref" 2>$null)
+    if (-not $h) { return $null }
+    $d = (git log -1 --format='%cI' "$Ref" 2>$null | Select-Object -First 1)
+    if ($d) { return "($Kind, $h, $d)" }
+    return "($Kind, $h, ?)"
+}
+
+# Report-only same-name lookup - ONE implementation shared by every branch-not-found
+# guard (base, explicit feature, recovered feature) so the search logic never forks:
+#   local-style name  -> search every remote-tracking ref with the same name
+#   remote-style name -> look on local branches + the OTHER remotes
+# Prints a FRAMED candidate list (kind, short hash, commit timestamp - ISO 8601 date +
+# time + UTC offset), or an explicit framed not-found line. REPORT-ONLY by design: it NEVER auto-selects, never
+# fetches/switches/creates anything - read-only local refs only; any lookup failure
+# prints nothing so the caller's own error line stands alone.
+function Show-BranchSuggestions {
+    param([Parameter(Mandatory = $true)] [string]$BranchName)
+    try {
+        $remoteNames = @(git remote 2>$null)
+        $slash = $BranchName.IndexOf('/')
+        $isRemoteStyle = $false
+        $rest = $BranchName
+        if ($slash -gt 0 -and $remoteNames.Count -gt 0) {
+            $prefix = $BranchName.Substring(0, $slash)
+            if ($remoteNames -contains $prefix) {
+                $isRemoteStyle = $true
+                $rest = $BranchName.Substring($slash + 1)
+            }
+        }
+        $found = @()
+        if ($isRemoteStyle) {
+            git rev-parse --verify --quiet "refs/heads/$rest" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { $found += ,@($rest, (Get-RefInfo "refs/heads/$rest" 'local')) }
+            foreach ($r in $remoteNames) {
+                if ($r -eq $prefix) { continue }
+                git rev-parse --verify --quiet "refs/remotes/$r/$rest" 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) { $found += ,@("$r/$rest", (Get-RefInfo "refs/remotes/$r/$rest" 'remote')) }
+            }
+        } else {
+            foreach ($r in $remoteNames) {
+                git rev-parse --verify --quiet "refs/remotes/$r/$BranchName" 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) { $found += ,@("$r/$BranchName", (Get-RefInfo "refs/remotes/$r/$BranchName" 'remote')) }
+            }
+        }
+        $found = @($found | Where-Object { $_[1] })
+        if ($found.Count -gt 0) {
+            $frameLines = @("Same name found elsewhere (kind, hash, committed at):")
+            $labelW = ($found | ForEach-Object { $_[0].Length } | Measure-Object -Maximum).Maximum
+            foreach ($f in $found) { $frameLines += ("  " + $f[0].PadRight($labelW + 2) + "  " + $f[1]) }
+            Write-EvidenceFrame -Lines $frameLines -Color Yellow
+        } else {
+            Write-EvidenceFrame -Lines @("Same name not found on any local branch or fetched remote-tracking ref.") -Color DarkGray
+        }
+    } catch {
+        # suggestion lookup is best-effort - never mask the caller's original error
+    }
+}
+
 git rev-parse --verify --quiet "$BaseBranch^{commit}" | Out-Null
 if ($LASTEXITCODE -ne 0) {
+    # REPORT-ONLY: suggestions print candidates (kind + hash + date); nothing is
+    # auto-selected and no ref is touched - the caller must re-run with the chosen name.
     Write-Host "Error: branch/commit '$BaseBranch' does not exist." -ForegroundColor Red
+    Show-BranchSuggestions -BranchName $BaseBranch
     exit 1
 }
 
@@ -239,6 +308,7 @@ if (-not [string]::IsNullOrWhiteSpace($FeatureBranch)) {
     git rev-parse --verify --quiet "$FeatureBranch^{commit}" | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Error: branch/commit '$FeatureBranch' does not exist." -ForegroundColor Red
+        Show-BranchSuggestions -BranchName $FeatureBranch
         exit 1
     }
     Write-Host "Source branch: $FeatureBranch (specified explicitly)" -ForegroundColor Cyan
@@ -264,6 +334,7 @@ if (-not [string]::IsNullOrWhiteSpace($FeatureBranch)) {
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Error: recovered source branch '$FeatureBranch' no longer exists." -ForegroundColor Red
         Write-Host "       Pass the source branch explicitly: rebuild-neo <base> <feature>" -ForegroundColor Red
+        Show-BranchSuggestions -BranchName $FeatureBranch
         exit 1
     }
 }
