@@ -1,3 +1,5 @@
+[English](./README.en.md) | **繁體中文**
+
 # rebuild-neo（`git-rebuild-merges`）
 
 在 Git 中，當我們使用 `git rebase --rebase-merges` 或進行多次 Squash 合併時，有時候會把分支的合併歷史弄亂，產生出看起來怪異、或是跟實際上不符的「假合併線」。
@@ -40,7 +42,7 @@ rebuild-neo <base> [<feature>] [選項]
 把本目錄加入 `PATH` 後，可用 git 子命令形式呼叫（`git-rebuild-merges.bat` 轉發給 `rebuild-neo.bat`，行為完全一致）：
 
 ```
-git-rebuild-merges <base> [<feature>] [選項]
+git rebuild-merges <base> [<feature>] [選項]
 ```
 
 ## 安全機制
@@ -120,4 +122,5 @@ git branch -D rebuild/<feature>-rebuilt
 | `rebuild-neo.bat` / `rebuild-neo.ps1` | 主腳本 |
 | `git-rebuild-merges.bat` | git 子命令別名啟動器（轉發給 `rebuild-neo.bat`） |
 | `rebuild-neo-tests/` | 測試分支的一鍵建構腳本 |
+| `README.md` | 本 README 的英文版 |
 | `README_DEV.md` | 開發紀錄：設計決策、實測案例與驗證方法 |
