@@ -31,14 +31,14 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 ```
 
 - 位置參數風格同 `git rebase <upstream> [<branch>]`；feature 省略時自動取目前分支（不修改它，只在 `rebuild/` 前綴臨時分支上工作）
-- `-f / -Force`：覆蓋已存在的臨時分支
+- `-f / -OverwriteTempBranch`：覆蓋已存在的臨時分支（`-Force` 為舊別名）
 - `-n / -DryRun`：只印出每支指令、不執行任何操作
 - `-RebuiltTag`：merge 訊息後追加 ` (Rebuilt)`（預設不加）
 - 所有建立 patch 之後的步驟都會先印出 `$ git ...` 指令再執行
 
 ## 版本狀態
 
-**ps1 最後更新：2026-10-31（本次收尾：新增「重建已落地偵測」與「遠端落後守衛」兩道防護；README 拆分為面向使用者的 README.md + 本開發紀錄）**
+**ps1 最後更新：2026-10-31（本次收尾：框線加**固定安全上限** `$MaxFrameWidth = 80`（常數、不偵測環境寬度）— **上限只作用於 `┌─/└─` 橫線本身**，內容一律原樣完整輸出（不折行、不截斷）**
 
 已實作：
 
@@ -61,7 +61,10 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 
 - **preflight 守衛後的衝突復原指引（本次新增）**：`pause` 後若未解決（非互動／stdin 重導向下立即返回），`write-tree` 失敗改為偵測 unmerged 路徑並印出明確復原步驟（列出未合併檔 → `git add -u` → `git reset --hard HEAD` 捨棄重跑），不再只印技術性 `index not in a committable state`
 - **未提交變更／未追蹤檔不再拒絕執行（前次改動）**：已追蹤的未提交變更（含 staged）`git stash push` 保存，主體包進 `try{...}finally{...}` 結束時 `git stash pop --index` 還原（`finally` 在 `exit` 時仍執行、保留退出碼，實測驗證）。變更既**不被拒絕**、也**不進 commit**（write-tree 只寫索引，暫存變更已 stash 離開）、更**不遺失**。finally 的 pop 失敗分兩種成因給對應指引：(a) pop **前**索引就有 unmerged（重建停在衝突中）→ 先修索引再 pop；(b) pop 前索引乾淨、pop 才衝突（stash 與重建改到同幾行）→ 真內容衝突。dry-run 不建立 stash、只印計畫。
-- **重建已落地偵測（本次新增）**：temp 分支 `rebuild/<feature>-rebuilt` 存在且為 feature 的祖先（例如已 `checkout -B <feature> <temp>` 落地過）→ 不再重跑「重建的重建」，印說明 exit 0；`-f` 為明確覆蓋（印 WARNING 後照跑，適用 base 已前移需重重建已落地分支的場景）
+- **重建已落地偵測（前次新增）**：temp 分支 `rebuild/<feature>-rebuilt` 存在且為 feature 的祖先（例如已 `checkout -B <feature> <temp>` 落地過）→ 不再重跑「重建的重建」，印說明 exit 0
+- **旗標拆分 `-RedoLanded`（前次修復）**：使用者發現 `-f` 被**多個守衛共用** — 加 `-f` 解「temp 已存在」時，落地守衛等後續守衛的 `-f` 分支會在**使用者不知情**下被帶過，且單次同意（consent）覆蓋多種語意。拆分後：`-f` 只保留機械語意（覆蓋臨時分支），落地重跑改為獨立旗標 **`-RedoLanded`**；**`-f` 不再穿越落地守衛**（即使傳入也被拒）；原則 = 每個守衛的覆蓋需各自明確選擇，單一旗標不得隱式授權多個守衛
+- **偵測證據的美化左框線（前次）＋橫線安全上限（本次）**：`Write-EvidenceFrame` — `┌─ / │ / └─` 開放式框（刻意**無右框線**）包住所有 `evidence:` 區塊，明確區分「偵測證據」與一般敘述輸出；頂底橫線以 `Get-DisplayWidth` 隨最寬內容自動對齊（東亞寬字元計 2 欄，CJK 分支名也不會歪）；**上限 `$MaxFrameWidth = 80` 為常數（依指示不偵測環境寬度），且只作用於 `┌─/└─` 橫線本身**（`min(內容寬+1, 80)`）— 內容行一律原樣完整輸出，**不做折行/截斷**（曾實作過折行機制，依指示移除：只需限制框線本身）；4 處套用：behind（證據+commit 清單）、diverged、落地守衛（多行+子行縮層）、已含於 base；框外保留 Error/指令列（主張在外、證據在框內的固定版式）
+- **`$Force` 改名 `$OverwriteTempBranch` + 消滅旗標複合 + consent 參數化（本次）**：① 參數改為語意明確的 `$OverwriteTempBranch`（`[Alias('f','Force')]` 保舊呼叫相容，但所有**輸出訊息一律用新名**）② **`$Force -or $RedoLanded` 複合徹底消除** — `CheckoutAction` 改為**狀態判斷**（`$tempExists` 由落地守衛的 rev-parse 捕捉後複用：temp 存在→`-B` 否則 `-b`），守衛各認各的旗標（temp 守衛只認 `$OverwriteTempBranch`、落地守衛只認 `$RedoLanded`）③ **`Write-AgentConsentReminder` 改為接收 `-Action` 參數** — 每處只印一行**情境專屬**提醒（覆蓋臨時分支 / 重跑已落地 / 替換原始分支），取代每次列舉全部危險動作的三行版，消除非必要雜訊；呼叫點全部補齊參數（裸呼叫=0）④ 落地拒絕訊息一次給全雙旗標指令 `-RedoLanded -OverwriteTempBranch`（實測證明缺一必被第二守衛擋，避免二輪猜旗標），temp 守衛在 `$RedoLanded` 已給時給出「需兩旗標」的情境變體訊息
 - **遠端落後守衛（本次新增）**：banner 後、任何變更動作前，best-effort 比對 base / feature 與 upstream（無 upstream 退回 `origin/<名稱>`）— 只 fetch 兩分支實際使用的遠端；**本地嚴格落後（`rev-list --left-right --count` 顯示僅遠端有 commits）→ 拒絕 exit 1** 並附 `git merge --ff-only` 更新指令；領先→提示、分歧→警告（重建本地內容）；無遠端／無 upstream／fetch 失敗／不可比對 → 一律只提示不中斷；比對全用穩定 plumbing（rev-parse / rev-list），不解析訊息文字；dry-run 不 fetch、用上次取得的遠端狀態
 - **未追蹤檔碰撞停車機制「遇到時才處理」（前次無差別、本次改為精準交集）**：實測確認 git 對未追蹤檔與 checkout/cherry-pick 碰撞**一律硬拒絕且不看內容是否相同**（同內容也拒、本地檔不銷毀、`stash -u` 還原不可靠）→ 殘留檔（切換/撤銷遺留、先行複製）會直接中斷重建。**停車集 = 未追蹤檔 ∩（base tree 路徑 ∪ `base..feature` 全部提交的 name-only 路徑）** — 即只停「checkout 寫 base 內容」與「重放 cherry-pick/merge/apply 寫範圍內路徑」真正會撞的檔；已枚舉腳本全部寫工作樹命令（checkout/cherry-pick/merge/apply/reset --hard/stash，後兩者只動 tracked）確認交集覆蓋完整，查詢全用穩定格式（porcelain / ls-tree / log --name-only）不解析易變錯誤訊息；**若預測有漏，退化為 git 明確拒絕（不會靜默）**。其餘未追蹤檔全程原地不動（`N other untracked file(s) do not collide - left in place`）。`finally` 歸還規則不變 — 路徑空→靜默歸位；**內容相同→丟停車副本**（無縫）；**內容不同→保留停車副本+警告**（worktree 留重建版，殘留永不混入未來 `git commit -a`，附 `git diff --no-index` 比對指令）。**「內容相同」的判定本次改為忽略空白/行尾/空行格式的等價比較**（`Get-FileEquivalence`：SHA-1 位元組快取路徑 → 不同時回退 `git diff --no-index --quiet --ignore-cr-at-eol --ignore-space-change --ignore-all-space --ignore-blank-lines`，exit 0 = 視為相同）— 解決 Windows 上 CRLF/LF、tab/空白重縮排、空行增減殘留被誤判為衝突的假陽性；三態返回 `Equal / Equivalent / Different`，`Equivalent` 在還原時無縫丟停車副本並附註記、在停車撞位時釋放路徑（不再後綴停車）。**八項邊界已實測**：CRLF/LF、縮排、tab vs 空格、空格數量、多餘空行、**檔案尾換行有無（舊邊界已消除）** 皆視為相同；真內容差異仍判不同。**BOM 有無升級為專屬偵測（本次）**：`Get-FileEquivalence` 第四態 `BomOnly` — 位元組比對發現「僅一側有 UTF-8 BOM、去 BOM 後內容全同」時不自動視為相同（BOM 常是**刻意增加或刪除**），機制維持保守（停車端：保留兩份 `.parkedN` 並註記、還原端：保留停車副本+manifest），但訊息改為專屬 `BOM DIFFERENCE` 通知（含檢查指令與「決定哪側該帶 BOM」指引），取代籠統的 `LEFTOVER CONFLICT`；BOM＋真內容差異仍回籠統訊息（已驗證不誤分流）。二進位仍走位元組精確比較（ignore 旗標不適用於二進位內容）。註：`--ignore-all-space` 語意下**純縮排差異也不再算差異**（前導縮排曾為刻意保留項，依指定旗標改為忽略）。停車撞位（同路徑已有前次停車副本）：等價→釋放路徑、異內容/BOM→唯一後綴 `.parkedN` + manifest `原路徑 => 停車路徑` 映射，兩份都保留。任何停車失敗 → 寫完 manifest 硬退。還原逐條 try/catch、刪除失敗降級 .NET API、計數失實不刪 manifest、manifest 自身不計入殘留掃描 — 皆為實測暴露的孤兒檔 bug 修復。**附帶修正：Content check MISMATCH 現在 exit 1**。dry-run 只印 would-park 計畫、也不再替前次停車執行還原（只提示）。
 - **`pause` 全手動路徑實測通過**：用 base 前移夾具湊齊三重條件（patch context 漂移 + `git merge` 衝突 + `apply --3way` 失敗）→ 正確抵達 `Pausing: resolve conflicts...`；重跑時 preflight 守衛正確擋下未解決的 `UU` 狀態
@@ -117,6 +120,10 @@ rebuild-neo <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]
 | 27 | BOM 專屬偵測（`BomOnly`） | neo | (T1) BOM-only 殘留（終版內容+BOM vs 無 BOM 提交檔）(T2) 停車撞位 BOM 變體 (負例) BOM+真內容差異 | PASS：(T1) **專屬 `BOM DIFFERENCE` 通知**（含檢查指令與「決定哪側帶 BOM」指引）、籠統訊息 0 次、停車+manifest 保留、tree 相同（不自動視為相同 — BOM 常為刻意增刪）；(T2) 停車端註記 `kept both copies; BOM changes can be deliberate` + `.parked2` 雙份保留 → 還原端 BOM 條目保留+plain 條目判相同丟棄、manifest 只留 BOM 條目；負例 BOM+真差異 → 回籠統 `LEFTOVER CONFLICT`（不誤分流）。**＋7 夾具回歸全綠 exit=0** |
 | 28 | 重建已落地偵測 | 克隆倉庫 | (a) 建 temp → 落地（`checkout -B <feature> <temp>`）→ 重跑 (b) 同上加 `-f` | PASS：(a) exit 0、`Nothing to do: ... already been landed`、零重放工作；(b) `-f` → `WARNING: ... already LANDED ... -f will rebuild the LANDED history` 後照跑完成（tree 仍相符）。落地守衛在 temp-exists 守衛之前給出更精確的說明 |
 | 29 | 遠端落後守衛 | 真實倉庫（非破壞性）＋克隆 | 真實：本地 `neo` 落後 `origin/neo` 8 commits（使用者倉庫真實狀態）；克隆：up-to-date 情境 | PASS（真實）：`git fetch origin` → `Error: local base branch 'neo' is BEHIND origin/neo by 8 commit(s)` + 更新指令、**exit 1 且零改動**（stash/checkout 均未觸碰 — HEAD 仍為使用者分支、未提交修改原封）；PASS（克隆）：`base 'neo' vs origin/neo: up to date` → 正常重建。領先/分歧共用同一 `rev-list --left-right --count` plumbing（已審閱，未個別造模擬遠端 — 依指示不強迫重現） |
+| 30 | 旗標拆分（`-f` vs `-RedoLanded`） | 真實倉庫＋克隆 | (a) 使用者原情境：temp 已存在不帶參數 (b) 同上加 `-f` (c) 落地後加 `-f` (d) 落地後加 `-RedoLanded` | PASS：(a) 與使用者所見一致（temp 已存在 → 提示 -f + consent，consent 已含 `-RedoLanded` 字樣）；(b) `-f` 通過 temp 守衛 → 遠端守衛證據化拒絕 exit 1、零改動（-f 只解機械問題，fetch 兩個遠端各按 upstream 解析）；**(c) 核心修復：落地後 `-f` 仍被拒**，訊息明示 `pass -RedoLanded (NOT -f)`；(d) `-RedoLanded` → WARNING 後執行、tree 相同、exit 0（本則訊息措辭已被案例 31 的雙旗標版本取代） |
+| 31 | 參數改名＋複合消除＋consent 參數化 | 真實倉庫＋克隆 | (T1) 無參數原情境 (T2) `-f` 舊別名 (3a) 落地+無參數 (3b) 落地+只給 `-RedoLanded` (3c) 落地+雙旗標 (a-reverify) 修正後拒絕訊息 | PASS：(T1) 訊息用新名 `-OverwriteTempBranch (-f)`＋**單行**情境 consent；(T2) 別名相容（`Overwrite mode` → 遠端守衛接管 exit 1、零改動）；(3a) 拒絕訊息一次給全雙旗標 + 情境 consent；(3b) **證明缺一不可** — WARNING 後 temp 守衛以「需兩旗標」情境變體擋下；(3c) 雙旗標 → WARNING+Overwrite+tree 相同 exit 0；殘留檢查：`$Force` 變數=0、`-or` 複合=0、裸 consent=0、`-Action` 呼叫=3 ✓ |
+| 32 | 偵測證據美化框線 | 真實倉庫＋克隆 | behind（真實）／落地（克隆）／已含於 base＋CJK 分支名（克隆）三處渲染；4 套用點逐一檢查 | PASS：behind 框 `┌─│└` 自動寬度、Error 與修復指令留框外、payload 兩空格縮層、`... and N more` 內含；落地多行框＋子行縮層 ✓；**CJK 分支名（`tmp/中文側支-001`）框線對齊**（`Get-DisplayWidth` 寬字元=2 欄生效）；呼叫點參數殘留檢查抓到並修正 1 處 `-ForegroundColor` 誤寫（應為 `-Color`）→ PARSE OK、雙邊已同步 |
+| 33 | 框線安全上限（僅橫線） | 真實倉庫＋克隆 | `$MaxFrameWidth=80` 常數（依指示不偵測環境寬度）；behind（74 欄）/ 落地（87 欄內容 vs 橫線）實測 | PASS：behind 橫線 74 ≤80 未觸發封頂；落地內容 87+2 欄時橫線 `min(88,80)`=**封頂 80**、**內容原樣 89 欄完整輸出**（不折行不截斷 — 曾實作折行機制，依「只限制框線本身」指示移除，`Split-FrameLine` 殘留=0）；PARSE OK、雙邊同步 |
 
 夾具設計要點：
 

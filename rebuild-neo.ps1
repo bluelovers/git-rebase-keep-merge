@@ -3,8 +3,16 @@
     [string]$BaseBranch,
     [Parameter(Position = 1)]
     [string]$FeatureBranch,
-    [Alias('f')]
-    [switch]$Force,
+    # Canonical name states exactly what it permits: overwriting the existing TEMP
+    # branch. 'f'/'Force' remain aliases so older invocations keep working, but every
+    # printed message shows the precise name. This flag is purely mechanical and never
+    # implies any other guard's permission (no -or-compounds across flags).
+    [Alias('f', 'Force')]
+    [switch]$OverwriteTempBranch,
+    # Redoing a LANDED rebuild is a separate, conscious decision with its own dedicated
+    # flag - one flag per guard, no flag implies another, so a single consent can never
+    # silently cover multiple guards.
+    [switch]$RedoLanded,
     [Alias('n')]
     [switch]$DryRun,
     [switch]$RebuiltTag,
@@ -50,14 +58,67 @@ function Test-Ancestor {
     return ($LASTEXITCODE -eq 0)
 }
 
-# Shared reminder shown next to every message that offers a destructive follow-up
-# (-f / force / overwrite, or moving the original branch onto the temp branch).
-# One wording, one definition - printed wherever such an option is suggested so an
-# AI agent reading any single message still sees the consent requirement.
+# Single source for the consent wording, but ONE context-specific line per situation
+# instead of enumerating every risky action every time - the reader gets exactly the
+# consent that applies HERE, with no unrelated noise. The caller passes the precise
+# action so each call site's message matches the guard that suggested it.
 function Write-AgentConsentReminder {
-    Write-Host " AGENT REMINDER: AI agents must ask the user for explicit permission first" -ForegroundColor DarkYellow
-    Write-Host "                 before running any force / -f / overwrite action, or before" -ForegroundColor DarkYellow
-    Write-Host "                 replacing the original branch with the temp branch." -ForegroundColor DarkYellow
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Action
+    )
+    Write-Host " AGENT REMINDER: ask the user for explicit permission before $Action." -ForegroundColor DarkYellow
+}
+
+# Display width counting East Asian wide characters as 2 columns, so the frame's
+# top/bottom rules align even when branch names or subjects contain CJK.
+function Get-DisplayWidth {
+    param([string]$Text)
+    $width = 0
+    foreach ($ch in $Text.ToCharArray()) {
+        $code = [int][char]$ch
+        if (($code -ge 0x1100 -and $code -le 0x115F) -or
+            ($code -ge 0x2E80 -and $code -le 0xA4CF) -or
+            ($code -ge 0xAC00 -and $code -le 0xD7A3) -or
+            ($code -ge 0xF900 -and $code -le 0xFAFF) -or
+            ($code -ge 0xFE30 -and $code -le 0xFE6F) -or
+            ($code -ge 0xFF00 -and $code -le 0xFF60) -or
+            ($code -ge 0xFFE0 -and $code -le 0xFFE6)) {
+            $width += 2
+        } else {
+            $width += 1
+        }
+    }
+    return $width
+}
+
+# Fixed maximum width for the FRAME BORDERS only - a deliberate CONSTANT (no
+# console-width probing, by design). Only the ─ rules are capped so the border itself
+# can never wrap; content lines always print in full (evidence is never folded or
+# truncated). Raise this one number if all target consoles are known to be wider.
+$MaxFrameWidth = 60
+
+# Beautified open-left frame (deliberately NO right border) around DETECTION / EVIDENCE
+# blocks. Proof output (hashes, counts, commit lists) must be visually separable from
+# ordinary script narration so a reader sees at a glance "these lines come from
+# verification". Rules auto-size to the widest line (CJK-aware) but never exceed
+# $MaxFrameWidth; content lines always print complete. One definition, one style -
+# callers pass the already-assembled lines and their color.
+function Write-EvidenceFrame {
+    param(
+        [Parameter(Mandatory = $true)] [string[]]$Lines,
+        [Parameter(Mandatory = $true)] [System.ConsoleColor]$Color
+    )
+    $maxW = 0
+    foreach ($line in $Lines) {
+        $w = Get-DisplayWidth $line
+        if ($w -gt $maxW) { $maxW = $w }
+    }
+    $ruleLen = [Math]::Min($maxW + 1, $MaxFrameWidth)
+    $rule = '─' * $ruleLen
+    Write-Host ('┌' + $rule) -ForegroundColor $Color
+    foreach ($line in $Lines) { Write-Host ('│ ' + $line) -ForegroundColor $Color }
+    Write-Host ('└' + $rule) -ForegroundColor $Color
 }
 
 # Leftover-parking equivalence: is this file the SAME file as that one?
@@ -124,11 +185,14 @@ function Get-FileEquivalence {
 # BaseBranch must be provided explicitly; no default inside the script.
 if ([string]::IsNullOrWhiteSpace($BaseBranch)) {
     Write-Host "Error: base branch is required." -ForegroundColor Red
-    Write-Host "Usage: .\rebuild-neo.ps1 <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag]" -ForegroundColor Yellow
+    Write-Host "Usage: .\rebuild-neo.ps1 <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag] [-RedoLanded]" -ForegroundColor Yellow
     Write-Host "  <base> [<feature>]  positional args, same style as: git rebase <upstream> [<branch>]" -ForegroundColor Yellow
-    Write-Host "  -f / -Force         overwrite an existing temp branch" -ForegroundColor Yellow
+    Write-Host "  -f / -OverwriteTempBranch  overwrite an existing temp branch (mechanical only;" -ForegroundColor Yellow
+    Write-Host "                      grants no other guard, never implies -RedoLanded)" -ForegroundColor Yellow
     Write-Host "  -n / -DryRun        print every command, execute nothing" -ForegroundColor Yellow
     Write-Host "  -RebuiltTag         append ' (Rebuilt)' to rebuilt merge messages (default: off)" -ForegroundColor Yellow
+    Write-Host "  -RedoLanded         redo a rebuild that was already landed (distinct from -f;" -ForegroundColor Yellow
+    Write-Host "                      -f alone never bypasses the landed guard)" -ForegroundColor Yellow
     exit 1
 }
 
@@ -212,30 +276,51 @@ $NewBranch = "rebuild/$FeatureBranch-rebuilt"
 # Re-running would only rebuild the already-rebuilt history - pointless. -f is the
 # explicit escape hatch for intentional rebuilds of a landed branch (e.g. base moved on).
 git rev-parse --verify --quiet "$NewBranch^{commit}" | Out-Null
-if ($LASTEXITCODE -eq 0 -and (Test-Ancestor $NewBranch $FeatureBranch)) {
-    if ($Force) {
+$tempExists = ($LASTEXITCODE -eq 0)
+if ($tempExists -and (Test-Ancestor $NewBranch $FeatureBranch)) {
+    # Evidence lines make the claim self-verifying (hashes + counts) so no follow-up
+    # commands are needed to check the guard's facts.
+    $tempTip = (git rev-parse --short=8 $NewBranch 2>$null)
+    $featTip = (git rev-parse --short=8 $FeatureBranch 2>$null)
+    $beyond  = (git rev-list --count "$NewBranch..$FeatureBranch" 2>$null)
+    if ($RedoLanded) {
         Write-Host " WARNING: the previous rebuild was already LANDED into '$FeatureBranch'" -ForegroundColor Yellow
-        Write-Host "          ($NewBranch is an ancestor of it). -f will rebuild the LANDED history." -ForegroundColor Yellow
+        Write-Host "          ($NewBranch @$tempTip is an ancestor of $FeatureBranch @$featTip," -ForegroundColor Yellow
+        Write-Host "           $beyond commit(s) beyond the landed tip)." -ForegroundColor Yellow
+        Write-Host "          -RedoLanded rebuilds the LANDED history (temp branch will be overwritten)." -ForegroundColor Yellow
     } else {
         Write-Host "Nothing to do: the previous rebuild has already been landed into '$FeatureBranch'." -ForegroundColor Yellow
-        Write-Host "  ($NewBranch is an ancestor of '$FeatureBranch'; rebuilding again would only" -ForegroundColor Yellow
-        Write-Host "   rebuild the already-rebuilt history.)" -ForegroundColor Yellow
-        Write-Host "  To redo anyway: pass -f, or delete the temp branch first: git branch -D $NewBranch" -ForegroundColor Yellow
-        Write-AgentConsentReminder
+        $landedEvidence = @("evidence: $NewBranch (@$tempTip) is an ancestor of '$FeatureBranch' (@$featTip)")
+        if ("$beyond" -eq '0') { $landedEvidence += "  -> '$FeatureBranch' points exactly at the landed tip" }
+        else { $landedEvidence += "  -> '$FeatureBranch' is $beyond commit(s) beyond the landed tip" }
+        $landedEvidence += "  (rebuilding again would only rebuild the already-rebuilt history)."
+        Write-EvidenceFrame -Lines $landedEvidence -Color Yellow
+        Write-Host "  To redo anyway: the landed guard AND the temp-overwrite guard must each be" -ForegroundColor Yellow
+        Write-Host "    passed explicitly:  -RedoLanded -OverwriteTempBranch" -ForegroundColor Yellow
+        Write-Host "    (a plain -f alone is never enough here), or delete the temp branch first:" -ForegroundColor Yellow
+        Write-Host "    git branch -D $NewBranch" -ForegroundColor Yellow
+        Write-AgentConsentReminder -Action "redoing an already-landed rebuild (-RedoLanded -OverwriteTempBranch)"
         exit 0
     }
 }
 
-if ($Force) {
-    Write-Host "Force mode (-f): existing temp branch '$NewBranch' will be overwritten." -ForegroundColor Magenta
-} else {
-    git rev-parse --verify --quiet "$NewBranch^{commit}" | Out-Null
-    if ($LASTEXITCODE -eq 0) {
+# Owns exactly ONE permission: overwriting the temp branch (-OverwriteTempBranch).
+# It never consults -RedoLanded (the landed guard above already got its own consent).
+if (-not $OverwriteTempBranch) {
+    if ($tempExists) {
         Write-Host "Error: temp branch '$NewBranch' already exists." -ForegroundColor Red
-        Write-Host "       Re-run with -f to overwrite it, or delete it first." -ForegroundColor Red
-        Write-AgentConsentReminder
+        if ($RedoLanded) {
+            Write-Host "       A -RedoLanded run also overwrites it: re-run with both flags," -ForegroundColor Red
+            Write-Host "         -RedoLanded -OverwriteTempBranch (-f), or delete it first: git branch -D $NewBranch" -ForegroundColor Red
+        } else {
+            Write-Host "       Re-run with -OverwriteTempBranch (-f) to overwrite it, or delete it first." -ForegroundColor Red
+        }
+        Write-AgentConsentReminder -Action "overwriting the existing temp branch (-OverwriteTempBranch / -f)"
         exit 1
     }
+}
+if ($OverwriteTempBranch -and $tempExists) {
+    Write-Host " Overwrite mode: existing temp branch '$NewBranch' will be overwritten." -ForegroundColor Magenta
 }
 
 Write-Host "========================================" -ForegroundColor Cyan
@@ -297,9 +382,15 @@ if ($upstreamMap.Count -eq 0) {
     if (-not $DryRun) {
         foreach ($r in $remotesNeeded) {
             Write-Host " Remote check: git fetch $r (updating remote-tracking refs)..." -ForegroundColor DarkGray
-            git fetch --quiet $r 2>$null
+            $fetchOut = git fetch --quiet $r 2>&1
             if ($LASTEXITCODE -ne 0) {
-                Write-Host " Warning: 'git fetch $r' failed (offline?) - comparing against its LAST fetched state." -ForegroundColor Yellow
+                # Embed the actual failure reason (network? auth? moved URL?) instead of
+                # guessing - saves a manual ls-remote/fetch round-trip.
+                $cause = ("$($fetchOut | Select-Object -First 1)").Trim()
+                if ($cause.Length -gt 120) { $cause = $cause.Substring(0, 120) + '...' }
+                if (-not $cause) { $cause = "(no error output; exit code $LASTEXITCODE)" }
+                Write-Host " Warning: 'git fetch $r' failed - comparing against its LAST fetched state." -ForegroundColor Yellow
+                Write-Host "   cause: $cause" -ForegroundColor Yellow
             }
         }
     } else {
@@ -321,17 +412,28 @@ if ($upstreamMap.Count -eq 0) {
         $parts = ("$counts".Trim()) -split '\s+'
         $localOnly = [int]$parts[0]
         $remoteOnly = [int]$parts[1]
+        $localTip = (git rev-parse --short=8 $bname 2>$null)
+        $remoteTip = (git rev-parse --short=8 $up 2>$null)
         if ($localOnly -eq 0 -and $remoteOnly -eq 0) {
-            Write-Host ("   " + $label + " '" + $bname + "' vs " + $up + ": up to date") -ForegroundColor DarkGray
+            Write-Host ("   " + $label + " '" + $bname + "' vs " + $up + ": up to date (both @$localTip)") -ForegroundColor DarkGray
         } elseif ($remoteOnly -gt 0 -and $localOnly -eq 0) {
+            # Evidence embedded: both tips, the exact count, and the missing commits
+            # themselves - the message is self-verifying, no follow-up commands needed.
             Write-Host ("Error: local " + $label + " branch '" + $bname + "' is BEHIND " + $up + " by $remoteOnly commit(s).") -ForegroundColor Red
+            $frameLines = @(("evidence: local @$localTip (0 unpushed) vs remote @$remoteTip ($remoteOnly unpulled):"))
+            $frameLines += @(git log --oneline --no-decorate "$bname..$up" 2>$null | Select-Object -First 5 | ForEach-Object { "  $_" })
+            if ($remoteOnly -gt 5) {
+                $frameLines += ("  ... and " + ($remoteOnly - 5) + " more (git log --oneline $bname..$up)")
+            }
+            Write-EvidenceFrame -Lines $frameLines -Color Red
             Write-Host ("       Rebuilding now would use stale content. Update first, then re-run:") -ForegroundColor Red
             Write-Host ("         git checkout $bname; git merge --ff-only $up") -ForegroundColor Yellow
             exit 1
         } elseif ($localOnly -gt 0 -and $remoteOnly -eq 0) {
-            Write-Host ("   " + $label + " '" + $bname + "' vs " + $up + ": ahead by $localOnly commit(s) (unpushed local work)") -ForegroundColor DarkGray
+            Write-Host ("   " + $label + " '" + $bname + "' vs " + $up + ": ahead by $localOnly commit(s) (unpushed local work; local @$localTip / remote @$remoteTip)") -ForegroundColor DarkGray
         } else {
             Write-Host ("   " + $label + " '" + $bname + "' vs " + $up + ": DIVERGED (local +$localOnly / remote +$remoteOnly) - rebuilding the LOCAL content") -ForegroundColor Yellow
+            Write-EvidenceFrame -Lines @("evidence: local @$localTip ($localOnly not pushed) / remote @$remoteTip ($remoteOnly not pulled)") -Color Yellow
         }
     }
 }
@@ -509,7 +611,11 @@ if ($untrackedList.Count -gt 0) {
 }
 
 # -B creates the temp branch, or resets it to base when -f is given.
-$CheckoutAction = if ($Force) { "-B" } else { "-b" }
+# State-driven, not flag-driven: the guards above already decided WHETHER overwriting is
+# permitted (-OverwriteTempBranch / -RedoLanded each settled their own guard), so here we
+# only read what exists: -B when the temp branch is present (overwrite/reset it), else -b.
+# No -or compound of flags anywhere.
+$CheckoutAction = if ($tempExists) { "-B" } else { "-b" }
 Invoke-Git -CommandArgs @('checkout', $CheckoutAction, $NewBranch, $BaseBranch)
 if (-not $DryRun -and $LASTEXITCODE -ne 0) {
     Write-Host "Error: cannot create or switch to temp branch $NewBranch" -ForegroundColor Red
@@ -523,7 +629,10 @@ $commits = Invoke-Git -Query -CommandArgs @('log', "$BaseBranch..$FeatureBranch"
 # Don't fall through to a misleading "Rebuild completed!" banner.
 if (-not $commits -or @($commits).Count -eq 0) {
     if (Test-Ancestor $FeatureBranch $BaseBranch) {
+        $fTip = (git rev-parse --short=8 $FeatureBranch 2>$null)
+        $bTip = (git rev-parse --short=8 $BaseBranch 2>$null)
         Write-Host "Nothing to rebuild: '$FeatureBranch' is already fully contained in '$BaseBranch'." -ForegroundColor Yellow
+        Write-EvidenceFrame -Lines @("evidence: '$FeatureBranch' (@$fTip) is an ancestor of '$BaseBranch' (@$bTip).") -Color Yellow
     } else {
         Write-Host "Nothing to rebuild: '$BaseBranch..$FeatureBranch' has no first-parent commits." -ForegroundColor Yellow
     }
@@ -799,7 +908,7 @@ Write-Host " If the rebuilt result is correct, make it permanent:" -ForegroundCo
 Write-Host "   git checkout -B $FeatureBranch $NewBranch" -ForegroundColor White
 Write-Host " (this moves '$FeatureBranch' to the rebuilt tip and switches to it;" -ForegroundColor DarkGray
 Write-Host "  then delete the temp branch: git branch -D $NewBranch)" -ForegroundColor DarkGray
-Write-AgentConsentReminder
+Write-AgentConsentReminder -Action "replacing '$FeatureBranch' with the rebuilt temp branch (git checkout -B ...)"
 Write-Host ""
 Write-Host " To discard the rebuild instead:" -ForegroundColor Cyan
 Write-Host "   git checkout $FeatureBranch" -ForegroundColor White
