@@ -1,4 +1,4 @@
-# rebuild-neo
+# rebuild-neo（`git-rebuild-merges`）
 
 以 `--no-ff` 分段重建分支的合併歷史，重新合併到指定 base 上。適用於 PR 分支因 `--rebase-merges` 或 squash 產生「假合併線」、需要恢復成真實合併節點的場合。
 
@@ -33,6 +33,14 @@ rebuild-neo <base> [<feature>] [選項]
 ```
 
 （即 `rebuild-neo.bat`，內部呼叫 `rebuild-neo.ps1`。）
+
+### `git-rebuild-merges` 別名
+
+把本目錄加入 `PATH` 後，可用 git 子命令形式呼叫（`git-rebuild-merges.bat` 轉發給 `rebuild-neo.bat`，行為完全一致）：
+
+```
+git-rebuild-merges <base> [<feature>] [選項]
+```
 
 ## 安全機制
 
@@ -69,5 +77,6 @@ git branch -D rebuild/<feature>-rebuilt
 | 檔案 | 說明 |
 |---|---|
 | `rebuild-neo.bat` / `rebuild-neo.ps1` | 主腳本 |
+| `git-rebuild-merges.bat` | git 子命令別名啟動器（轉發給 `rebuild-neo.bat`） |
 | `rebuild-neo-tests/` | 測試分支的一鍵建構腳本 |
 | `README_DEV.md` | 開發紀錄：設計決策、實測案例與驗證方法 |
