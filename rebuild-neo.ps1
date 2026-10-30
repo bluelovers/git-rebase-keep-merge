@@ -26,12 +26,24 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 # Print every git command before it runs.
 # -Query commands are read-only and always executed (dry-run needs their output to build the plan).
 # Everything else is skipped entirely under -DryRun, so no repository state ever changes.
+# -Separator brackets a command's CONSOLE output with separator lines so raw git output is
+# visually grouped and distinguishable from the script's own messages:
+#   - streaming commands (checkout/cherry-pick/merge/apply/stash/reset): stdout+stderr are
+#     buffered and a top/bottom rule pair is printed ONLY when git produced something -
+#     plain `git apply` is silent on success, so there is never an empty bracket pair;
+#     output appears when the command completes instead of live-streamed (these commands
+#     are all short). Returns no value; callers rely on $LASTEXITCODE only.
+#   - -Capture commands: git's stderr detail is framed only when the command FAILS (success
+#     stays silent - the returned value is unaffected either way);
+#   - -Query commands: no effect - their output is returned to the caller, who shows it as
+#     part of its own messages.
 function Invoke-Git {
     param(
         [Parameter(Mandatory = $true, Position = 0)]
         [string[]]$CommandArgs,
         [switch]$Query,
-        [switch]$Capture
+        [switch]$Capture,
+        [switch]$Separator
     )
     Write-Host ('  $ git ' + ($CommandArgs -join ' ')) -ForegroundColor DarkGray
     if ($Query) {
@@ -40,8 +52,37 @@ function Invoke-Git {
     if ($DryRun) {
         return
     }
+    # Fixed-width separator rules - deliberately <= $MaxFrameWidth (no console-width probing).
+    $sepW = [Math]::Min(42, $MaxFrameWidth)
+    $sepTop = '  git output ' + ('─' * [Math]::Max(1, $sepW - 13))
+    $sepEnd = '  ' + ('─' * [Math]::Max(1, $sepW - 2))
     if ($Capture) {
-        return (& git @CommandArgs)
+        if (-not $Separator) { return (& git @CommandArgs) }
+        # Merge stderr into the captured stream: on success that is just the returned value
+        # (hash etc., framed nothing); on failure git's raw detail is grouped between the
+        # separators instead of leaking loose among the script's own messages.
+        $out = & git @CommandArgs 2>&1
+        if ($LASTEXITCODE -ne 0 -and $out) {
+            Write-Host $sepTop -ForegroundColor DarkGray
+            foreach ($outLine in @($out)) { Write-Host ('  ' + "$outLine") }
+            Write-Host $sepEnd -ForegroundColor DarkGray
+        }
+        return $out
+    }
+    if ($Separator) {
+        # Buffer stdout+stderr and print the frame ONLY when git actually produced
+        # something: plain `git apply` is silent on success, so an unconditional bracket
+        # pair would print around nothing. These commands are short, so buffering is a
+        # non-issue (output appears on completion rather than live-streamed) and raw
+        # failure/warning text gets grouped by the same rules. Returns no value - callers
+        # of -Separator commands rely on $LASTEXITCODE only.
+        $out = & git @CommandArgs 2>&1
+        if ($out) {
+            Write-Host $sepTop -ForegroundColor DarkGray
+            foreach ($outLine in @($out)) { Write-Host "$outLine" }
+            Write-Host $sepEnd -ForegroundColor DarkGray
+        }
+        return
     }
     & git @CommandArgs
 }
@@ -521,8 +562,14 @@ $Stashed = $false
 $TrackedChanges = Invoke-Git -Query -CommandArgs @('status', '--porcelain', '--untracked-files=no')
 if ($TrackedChanges) {
     Write-Host " Uncommitted tracked changes detected - they will be stashed first:" -ForegroundColor Yellow
-    $TrackedChanges | Select-Object -First 10 | ForEach-Object { Write-Host ("       " + $_) -ForegroundColor DarkGray }
-    Invoke-Git -CommandArgs @('stash', 'push', '-m', 'rebuild-neo auto-stash')
+    # Frame the file list (evidence of WHAT is about to be stashed); header stays
+    # outside per the established claim-outside / evidence-inside layout. Truncation is
+    # never silent - the frame says how many more were omitted.
+    $trackedFrame = @($TrackedChanges | Select-Object -First 10 | ForEach-Object { "$_" })
+    $trackedTotal = @($TrackedChanges).Count
+    if ($trackedTotal -gt 10) { $trackedFrame += ("... and " + ($trackedTotal - 10) + " more") }
+    Write-EvidenceFrame -Lines $trackedFrame -Color DarkGray
+    Invoke-Git -Separator -CommandArgs @('stash', 'push', '-m', 'rebuild-neo auto-stash')
     if ($DryRun) {
         Write-Host "  -> (dry run) would stash the changes above, then pop them again at the end." -ForegroundColor DarkGray
     } elseif ($LASTEXITCODE -eq 0) {
@@ -590,9 +637,12 @@ $untrackedList = @($untrackedPaths | Where-Object { $collisionPaths.Contains($_)
 $leftAlone = $untrackedPaths.Count - $untrackedList.Count
 if ($untrackedList.Count -gt 0) {
     Write-Host " Untracked files that WOULD collide with the rebuild - parking them for the run:" -ForegroundColor Yellow
-    $untrackedList | Select-Object -First 10 | ForEach-Object { Write-Host ("       " + $_) -ForegroundColor DarkGray }
-    if ($untrackedList.Count -gt 10) { Write-Host ("       ... and " + ($untrackedList.Count - 10) + " more") -ForegroundColor DarkGray }
-    if ($leftAlone -gt 0) { Write-Host ("       ($leftAlone other untracked file(s) do not collide - left in place)") -ForegroundColor DarkGray }
+    # Frame the colliding-file list (evidence of exactly WHAT gets parked); header stays
+    # outside, truncation is announced inside - same layout as the tracked-stash frame.
+    $parkFrame = @($untrackedList | Select-Object -First 10 | ForEach-Object { "$_" })
+    if ($untrackedList.Count -gt 10) { $parkFrame += ("... and " + ($untrackedList.Count - 10) + " more") }
+    Write-EvidenceFrame -Lines $parkFrame -Color DarkGray
+    if ($leftAlone -gt 0) { Write-Host " ($leftAlone other untracked file(s) do not collide - left in place)" -ForegroundColor DarkGray }
     if ($DryRun) {
         Write-Host "  -> (dry run) would park the files above under $leftoverDir and return them at the end." -ForegroundColor DarkGray
     } else {
@@ -687,7 +737,7 @@ if ($untrackedList.Count -gt 0) {
 # only read what exists: -B when the temp branch is present (overwrite/reset it), else -b.
 # No -or compound of flags anywhere.
 $CheckoutAction = if ($tempExists) { "-B" } else { "-b" }
-Invoke-Git -CommandArgs @('checkout', $CheckoutAction, $NewBranch, $BaseBranch)
+Invoke-Git -Separator -CommandArgs @('checkout', $CheckoutAction, $NewBranch, $BaseBranch)
 if (-not $DryRun -and $LASTEXITCODE -ne 0) {
     Write-Host "Error: cannot create or switch to temp branch $NewBranch" -ForegroundColor Red
     exit 1
@@ -710,7 +760,14 @@ if (-not $commits -or @($commits).Count -eq 0) {
     exit 0
 }
 
+# One shared, zero-padded node counter (001, 002, ...) covering BOTH header types so the
+# replay sequence reads as a single numbered list. The number is pre-formatted into
+# $nodeTag and interpolated - never passed through -f with the message, because commit
+# subjects may legally contain { } braces.
+$nodeNo = 0
 foreach ($c in $commits) {
+    $nodeNo++
+    $nodeTag = '{0:D3}' -f $nodeNo
     $parts = $c -split ' ', 2
     $hash = $parts[0]
     $msg = $parts[1]
@@ -726,7 +783,7 @@ foreach ($c in $commits) {
     # cherry-pick path, otherwise merging it would drag the old history back in as an
     # ancestor - exactly what this tool exists to prevent.
     if ($parentCount -gt 1) {
-        Write-Host "`n[Merge commit detected] $hash - $msg" -ForegroundColor Yellow
+        Write-Host "`n[$nodeTag] [Merge commit detected] $hash - $msg" -ForegroundColor Yellow
 
         # Side parents ^2..^N (octopus merges have 3+ parents; all must be replayed or
         # their content is silently lost).
@@ -751,14 +808,14 @@ foreach ($c in $commits) {
             $ctArgs = @('commit-tree', 'HEAD^{tree}', '-p', 'HEAD')
             foreach ($t in $sideParents) { $ctArgs += @('-p', $t) }
             $ctArgs += @('-m', $commitMessage)
-            $newCommit = Invoke-Git -Capture -CommandArgs $ctArgs
+            $newCommit = Invoke-Git -Capture -Separator -CommandArgs $ctArgs
             if ($LASTEXITCODE -ne 0 -or "$newCommit" -notmatch '^[0-9a-f]{7,40}$') {
                 Write-Host "  -> Error: commit-tree failed for empty merge of $hash" -ForegroundColor Red
                 exit 1
             }
             $newCommit = "$newCommit".Trim()
             # Tree is identical to HEAD's tree, so --hard moves the branch without touching content.
-            Invoke-Git -CommandArgs @('reset', '--hard', $newCommit)
+            Invoke-Git -Separator -CommandArgs @('reset', '--hard', $newCommit)
             if ($LASTEXITCODE -ne 0) {
                 Write-Host "  -> Error: failed to attach the empty merge commit $newCommit" -ForegroundColor Red
                 exit 1
@@ -772,7 +829,8 @@ foreach ($c in $commits) {
 
         # --binary: embed binary payloads, otherwise `git apply --3way` in the conflict
         # fallback cannot restore binary files touched by the merge.
-        # git writes the patch file directly: no shell redirection, no caret escaping, no encoding corruption
+        # git writes the patch file directly: no shell redirection, no caret escaping, no encoding corruption.
+        # (no -Separator: silent on success - a bracket pair would print around nothing.)
         Invoke-Git -CommandArgs @('diff', '--binary', "--output=$targetPatchFile", "$hash^", $hash)
         if ($DryRun) {
             Write-Host "  -> (dry run) would extract patch to: $patchPath" -ForegroundColor DarkGray
@@ -797,13 +855,13 @@ foreach ($c in $commits) {
             $ctArgs = @('commit-tree', "$curTree".Trim(), '-p', 'HEAD')
             foreach ($t in $sideParents) { $ctArgs += @('-p', $t) }
             $ctArgs += @('-m', $commitMessage)
-            $newCommit = Invoke-Git -Capture -CommandArgs $ctArgs
+            $newCommit = Invoke-Git -Capture -Separator -CommandArgs $ctArgs
             if ($LASTEXITCODE -ne 0 -or "$newCommit" -notmatch '^[0-9a-f]{7,40}$') {
                 Write-Host "  -> Error: commit-tree failed for content-neutral merge of $hash" -ForegroundColor Red
                 exit 1
             }
             $newCommit = "$newCommit".Trim()
-            Invoke-Git -CommandArgs @('reset', '--hard', $newCommit)
+            Invoke-Git -Separator -CommandArgs @('reset', '--hard', $newCommit)
             if ($LASTEXITCODE -ne 0) {
                 Write-Host "  -> Error: failed to attach the content-neutral merge commit $newCommit" -ForegroundColor Red
                 exit 1
@@ -835,7 +893,7 @@ foreach ($c in $commits) {
         $appliedOK   = $false
 
         # --- Primary: faithful patch replay (handles renames) ---
-        Invoke-Git -CommandArgs @('apply', '--index', $targetPatchFile)
+        Invoke-Git -Separator -CommandArgs @('apply', '--index', $targetPatchFile)
         if ($LASTEXITCODE -eq 0) {
             $appliedOK = $true
             Write-Host "  -> Patch applied cleanly (faithful first-parent replay)." -ForegroundColor Green
@@ -843,15 +901,17 @@ foreach ($c in $commits) {
             # Context drifted. `git apply` is all-or-nothing, but reset anyway so the merge
             # below always starts from a clean tree regardless of git version behaviour.
             Write-Host "  -> Patch context drifted (base moved?); falling back to git merge --no-ff..." -ForegroundColor Yellow
-            Invoke-Git -CommandArgs @('reset', '--hard', 'HEAD')
-            Invoke-Git -CommandArgs (@('merge', '--no-ff') + $sideParents + @('-m', $commitMessage))
+            Invoke-Git -Separator -CommandArgs @('reset', '--hard', 'HEAD')
+            Invoke-Git -Separator -CommandArgs (@('merge', '--no-ff') + $sideParents + @('-m', $commitMessage))
             if ($LASTEXITCODE -eq 0) {
                 $mergedClean = $true
                 Write-Host "  -> Merge completed cleanly, no conflicts." -ForegroundColor Green
             } else {
                 Write-Host "  -> Conflict detected! Falling back to 3-way patch application..." -ForegroundColor Yellow
-                Invoke-Git -CommandArgs @('merge', '--abort')
-                Invoke-Git -CommandArgs @('apply', '--3way', '--index', $targetPatchFile)
+                # (no -Separator: `git merge --abort` is silent on success - a bracket pair
+            # would print around nothing; its raw failure text still streams visibly.)
+            Invoke-Git -CommandArgs @('merge', '--abort')
+                Invoke-Git -Separator -CommandArgs @('apply', '--3way', '--index', $targetPatchFile)
                 if ($LASTEXITCODE -ne 0) {
                     Write-Host "  -> Patch could not apply cleanly. Pausing: resolve conflicts in the working tree," -ForegroundColor Red
                     Write-Host "  ->    stage the result with 'git add -u', then press any key to continue..." -ForegroundColor Red
@@ -868,7 +928,7 @@ foreach ($c in $commits) {
         # already created its own commit, so we skip finishing in that case. A plain `git commit`
         # here would silently degrade the merge into a single-parent commit.
         if (-not $mergedClean) {
-            $mergedTree = Invoke-Git -Capture -CommandArgs @('write-tree')
+            $mergedTree = Invoke-Git -Capture -Separator -CommandArgs @('write-tree')
             if ($LASTEXITCODE -ne 0 -or "$mergedTree" -notmatch '^[0-9a-f]{7,40}$') {
                 # Most common cause: the conflict-fallback `pause` was passed without resolving
                 # and staging first (e.g. auto-run with redirected stdin), leaving unmerged paths.
@@ -889,13 +949,13 @@ foreach ($c in $commits) {
             $ctArgs = @('commit-tree', "$mergedTree".Trim(), '-p', 'HEAD')
             foreach ($t in $sideParents) { $ctArgs += @('-p', $t) }
             $ctArgs += @('-m', $commitMessage)
-            $newCommit = Invoke-Git -Capture -CommandArgs $ctArgs
+            $newCommit = Invoke-Git -Capture -Separator -CommandArgs $ctArgs
             if ($LASTEXITCODE -ne 0 -or "$newCommit" -notmatch '^[0-9a-f]{7,40}$') {
                 Write-Host "  -> Error: commit-tree failed while finishing the patch-applied merge." -ForegroundColor Red
                 exit 1
             }
             $newCommit = "$newCommit".Trim()
-            Invoke-Git -CommandArgs @('reset', '--hard', $newCommit)
+            Invoke-Git -Separator -CommandArgs @('reset', '--hard', $newCommit)
             if ($LASTEXITCODE -ne 0) {
                 Write-Host "  -> Error: failed to attach the merge commit $newCommit" -ForegroundColor Red
                 exit 1
@@ -904,7 +964,7 @@ foreach ($c in $commits) {
         }
 
     } else {
-        Write-Host "`n[Regular commit] $hash - $msg" -ForegroundColor Cyan
+        Write-Host "`n[$nodeTag] [Regular commit] $hash - $msg" -ForegroundColor Cyan
         # An empty commit (no file changes vs its parent) makes plain cherry-pick fail with
         # "The previous cherry-pick is now empty"; replay it explicitly as an empty commit
         # so the node mapping stays 1:1.
@@ -915,9 +975,9 @@ foreach ($c in $commits) {
         }
         if ($isEmpty) {
             Write-Host "  -> Empty commit detected; replaying with --allow-empty." -ForegroundColor DarkGray
-            Invoke-Git -CommandArgs @('cherry-pick', '--allow-empty', $hash)
+            Invoke-Git -Separator -CommandArgs @('cherry-pick', '--allow-empty', $hash)
         } else {
-            Invoke-Git -CommandArgs @('cherry-pick', $hash)
+            Invoke-Git -Separator -CommandArgs @('cherry-pick', $hash)
         }
 
         if ($DryRun) {
@@ -1006,7 +1066,7 @@ Write-Host "========================================" -ForegroundColor Green
             Write-Host "  git stash list        # your changes are SAFE here ('rebuild-neo auto-stash')" -ForegroundColor Yellow
             Write-Host "  git stash pop --index # restore them after the index is clean" -ForegroundColor Yellow
         } else {
-            Invoke-Git -CommandArgs @('stash', 'pop', '--index')
+            Invoke-Git -Separator -CommandArgs @('stash', 'pop', '--index')
             if ($DryRun) {
                 Write-Host "  -> (dry run) stash was not created; nothing to pop." -ForegroundColor DarkGray
             } elseif ($LASTEXITCODE -ne 0) {
