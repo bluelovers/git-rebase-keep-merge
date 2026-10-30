@@ -123,5 +123,5 @@ Yes. The merge nodes are rebuilt as new commits, so their hashes necessarily dif
 | `rebuild-neo.bat` / `rebuild-neo.ps1` | Main scripts |
 | `git-rebuild-merges.bat` | git subcommand alias launcher (forwards to `rebuild-neo.bat`) |
 | `rebuild-neo-tests/` | One-click fixture-branch build scripts |
-| `README.zh-Hant.md` | Traditional Chinese version of this README |
+| `README.md` | Traditional Chinese version of this README |
 | `README_DEV.md` | Development log: design decisions, test cases, and verification methods |

@@ -122,5 +122,5 @@ git branch -D rebuild/<feature>-rebuilt
 | `rebuild-neo.bat` / `rebuild-neo.ps1` | 主腳本 |
 | `git-rebuild-merges.bat` | git 子命令別名啟動器（轉發給 `rebuild-neo.bat`） |
 | `rebuild-neo-tests/` | 測試分支的一鍵建構腳本 |
-| `README.md` | 本 README 的英文版 |
+| `README.en.md` | 本 README 的英文版 |
 | `README_DEV.md` | 開發紀錄：設計決策、實測案例與驗證方法 |
