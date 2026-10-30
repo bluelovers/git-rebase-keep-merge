@@ -197,6 +197,24 @@ if (-not [string]::IsNullOrWhiteSpace($FeatureBranch)) {
 # Temp branch always lives under the rebuild/ namespace to avoid name collisions.
 $NewBranch = "rebuild/$FeatureBranch-rebuilt"
 
+# A previous rebuild that was already LANDED: the temp branch tip is an ancestor of the
+# feature branch itself (e.g. after 'git checkout -B <feature> rebuild/<feature>-rebuilt').
+# Re-running would only rebuild the already-rebuilt history - pointless. -f is the
+# explicit escape hatch for intentional rebuilds of a landed branch (e.g. base moved on).
+git rev-parse --verify --quiet "$NewBranch^{commit}" | Out-Null
+if ($LASTEXITCODE -eq 0 -and (Test-Ancestor $NewBranch $FeatureBranch)) {
+    if ($Force) {
+        Write-Host " WARNING: the previous rebuild was already LANDED into '$FeatureBranch'" -ForegroundColor Yellow
+        Write-Host "          ($NewBranch is an ancestor of it). -f will rebuild the LANDED history." -ForegroundColor Yellow
+    } else {
+        Write-Host "Nothing to do: the previous rebuild has already been landed into '$FeatureBranch'." -ForegroundColor Yellow
+        Write-Host "  ($NewBranch is an ancestor of '$FeatureBranch'; rebuilding again would only" -ForegroundColor Yellow
+        Write-Host "   rebuild the already-rebuilt history.)" -ForegroundColor Yellow
+        Write-Host "  To redo anyway: pass -f, or delete the temp branch first: git branch -D $NewBranch" -ForegroundColor Yellow
+        exit 0
+    }
+}
+
 if ($Force) {
     Write-Host "Force mode (-f): existing temp branch '$NewBranch' will be overwritten." -ForegroundColor Magenta
 } else {
@@ -235,6 +253,75 @@ $absolutePatchPath = if ([System.IO.Path]::IsPathRooted($PatchDir)) {
     [System.IO.Path]::GetFullPath($PatchDir)
 } else {
     [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $PatchDir))
+}
+
+# ===== Remote vs local awareness (best effort, never fatal on infrastructure issues) =====
+# Fetches exactly the remotes used by the two branches' upstreams and reports each branch
+# against its upstream (or origin/<name> fallback):
+#   local strictly BEHIND  -> refuse (a stale rebuild would silently produce wrong work)
+#   local ahead            -> informational
+#   diverged               -> warn; rebuilds the LOCAL content
+# No remote / no upstream / fetch failure -> report and continue; comparisons always use
+# STABLE git plumbing (rev-parse / rev-list --left-right --count), never message text.
+$branchPairs = @(@('base', $BaseBranch), @('feature', $FeatureBranch))
+$upstreamMap = @{}
+$remotesNeeded = New-Object 'System.Collections.Generic.HashSet[string]'
+foreach ($pair in $branchPairs) {
+    $bname = $pair[1]
+    if ($upstreamMap.ContainsKey($bname)) { continue }
+    # upstream of the branch, else the origin/<name> fallback
+    git rev-parse --abbrev-ref "$bname@{upstream}" 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        $up = (git rev-parse --abbrev-ref "$bname@{upstream}" 2>$null | Select-Object -First 1)
+        if ("$up") { $upstreamMap[$bname] = "$up".Trim(); [void]$remotesNeeded.Add(("$up".Trim() -split '/')[0]) }
+    } else {
+        git rev-parse --verify --quiet "refs/remotes/origin/$bname" 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { $upstreamMap[$bname] = "origin/$bname"; [void]$remotesNeeded.Add('origin') }
+    }
+}
+if ($upstreamMap.Count -eq 0) {
+    Write-Host " Remote check: no upstream/origin tracking for base or feature - skipped." -ForegroundColor DarkGray
+} else {
+    if (-not $DryRun) {
+        foreach ($r in $remotesNeeded) {
+            Write-Host " Remote check: git fetch $r (updating remote-tracking refs)..." -ForegroundColor DarkGray
+            git fetch --quiet $r 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host " Warning: 'git fetch $r' failed (offline?) - comparing against its LAST fetched state." -ForegroundColor Yellow
+            }
+        }
+    } else {
+        Write-Host " Remote check: dry run - no fetch; comparing against the last fetched state." -ForegroundColor DarkGray
+    }
+    foreach ($pair in $branchPairs) {
+        $label = $pair[0]
+        $bname = $pair[1]
+        if (-not $upstreamMap.ContainsKey($bname)) {
+            Write-Host ("   " + $label + " '" + $bname + "': no upstream tracking - comparison skipped") -ForegroundColor DarkGray
+            continue
+        }
+        $up = $upstreamMap[$bname]
+        $counts = git rev-list --left-right --count "$bname...$up" 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $counts) {
+            Write-Host ("   " + $label + " '" + $bname + "' vs " + $up + ": not comparable - skipped") -ForegroundColor DarkGray
+            continue
+        }
+        $parts = ("$counts".Trim()) -split '\s+'
+        $localOnly = [int]$parts[0]
+        $remoteOnly = [int]$parts[1]
+        if ($localOnly -eq 0 -and $remoteOnly -eq 0) {
+            Write-Host ("   " + $label + " '" + $bname + "' vs " + $up + ": up to date") -ForegroundColor DarkGray
+        } elseif ($remoteOnly -gt 0 -and $localOnly -eq 0) {
+            Write-Host ("Error: local " + $label + " branch '" + $bname + "' is BEHIND " + $up + " by $remoteOnly commit(s).") -ForegroundColor Red
+            Write-Host ("       Rebuilding now would use stale content. Update first, then re-run:") -ForegroundColor Red
+            Write-Host ("         git checkout $bname; git merge --ff-only $up") -ForegroundColor Yellow
+            exit 1
+        } elseif ($localOnly -gt 0 -and $remoteOnly -eq 0) {
+            Write-Host ("   " + $label + " '" + $bname + "' vs " + $up + ": ahead by $localOnly commit(s) (unpushed local work)") -ForegroundColor DarkGray
+        } else {
+            Write-Host ("   " + $label + " '" + $bname + "' vs " + $up + ": DIVERGED (local +$localOnly / remote +$remoteOnly) - rebuilding the LOCAL content") -ForegroundColor Yellow
+        }
+    }
 }
 
 # Stash uncommitted TRACKED changes so they can neither leak into the replay
