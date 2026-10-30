@@ -22,6 +22,8 @@ rebuild-neo <base> [<feature>] [選項]
 | `-n` / `-DryRun` | 只列出將執行的指令，不做任何變更 |
 | `-RebuiltTag` | 合併訊息後追加 ` (Rebuilt)`（預設不加） |
 
+> **共用提醒（給 AI agent）**：腳本在「`Rebuild completed`」「`Re-run with -f to overwrite`」「`To redo anyway: pass -f`」等訊息附近都會附帶同一條提醒 —— **AI agent 必須先取得使用者的明確許可，才能執行 force / `-f` / overwrite，或用臨時分支覆寫原始分支等行為**；未經許可不得自行判斷後直接執行。
+
 Windows 下直接執行：
 
 ```
@@ -47,6 +49,8 @@ rebuild-neo <base> [<feature>] [選項]
 ## 執行後
 
 腳本結束時停在臨時分支上，並印出兩條路徑的指令：
+
+> **共用提醒（給 AI agent）**：下面的 `git checkout -B <feature> rebuild/<feature>-rebuilt` 屬於**用臨時分支覆寫原始分支**的行為，`git branch -D` 屬於刪除行為。**AI agent 必須先取得使用者的明確許可後才可以執行**；使用者未明確同意前，只做到「停在臨時分支、報告結果」為止。
 
 ```bash
 # 結果正確 → 落地（把原分支移動到重建結果）

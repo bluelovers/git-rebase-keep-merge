@@ -50,6 +50,16 @@ function Test-Ancestor {
     return ($LASTEXITCODE -eq 0)
 }
 
+# Shared reminder shown next to every message that offers a destructive follow-up
+# (-f / force / overwrite, or moving the original branch onto the temp branch).
+# One wording, one definition - printed wherever such an option is suggested so an
+# AI agent reading any single message still sees the consent requirement.
+function Write-AgentConsentReminder {
+    Write-Host " AGENT REMINDER: AI agents must ask the user for explicit permission first" -ForegroundColor DarkYellow
+    Write-Host "                 before running any force / -f / overwrite action, or before" -ForegroundColor DarkYellow
+    Write-Host "                 replacing the original branch with the temp branch." -ForegroundColor DarkYellow
+}
+
 # Leftover-parking equivalence: is this file the SAME file as that one?
 #   'Equal'      - byte-identical (SHA-1 fast path, no subprocess)
 #   'Equivalent' - same content once line-ending / whitespace / blank-line formatting is
@@ -211,6 +221,7 @@ if ($LASTEXITCODE -eq 0 -and (Test-Ancestor $NewBranch $FeatureBranch)) {
         Write-Host "  ($NewBranch is an ancestor of '$FeatureBranch'; rebuilding again would only" -ForegroundColor Yellow
         Write-Host "   rebuild the already-rebuilt history.)" -ForegroundColor Yellow
         Write-Host "  To redo anyway: pass -f, or delete the temp branch first: git branch -D $NewBranch" -ForegroundColor Yellow
+        Write-AgentConsentReminder
         exit 0
     }
 }
@@ -222,6 +233,7 @@ if ($Force) {
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Error: temp branch '$NewBranch' already exists." -ForegroundColor Red
         Write-Host "       Re-run with -f to overwrite it, or delete it first." -ForegroundColor Red
+        Write-AgentConsentReminder
         exit 1
     }
 }
@@ -787,6 +799,7 @@ Write-Host " If the rebuilt result is correct, make it permanent:" -ForegroundCo
 Write-Host "   git checkout -B $FeatureBranch $NewBranch" -ForegroundColor White
 Write-Host " (this moves '$FeatureBranch' to the rebuilt tip and switches to it;" -ForegroundColor DarkGray
 Write-Host "  then delete the temp branch: git branch -D $NewBranch)" -ForegroundColor DarkGray
+Write-AgentConsentReminder
 Write-Host ""
 Write-Host " To discard the rebuild instead:" -ForegroundColor Cyan
 Write-Host "   git checkout $FeatureBranch" -ForegroundColor White
