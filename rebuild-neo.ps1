@@ -13,6 +13,12 @@
     # flag - one flag per guard, no flag implies another, so a single consent can never
     # silently cover multiple guards.
     [switch]$RedoLanded,
+    # Replay ceiling (destructive-scale guard): refuse a first-parent range larger than
+    # this (default 10). -1 = unlimited (still warns above the default). Raising this
+    # value is a dangerous-class change and always carries the consent reminder.
+    # Validated in-script (not ValidateRange) so -1 stays legal and invalid values get a
+    # friendly message instead of a parameter-binding error.
+    [int]$MaxCommits = 10,
     [Alias('n')]
     [switch]$DryRun,
     [switch]$RebuiltTag,
@@ -226,7 +232,7 @@ function Get-FileEquivalence {
 # BaseBranch must be provided explicitly; no default inside the script.
 if ([string]::IsNullOrWhiteSpace($BaseBranch)) {
     Write-Host "Error: base branch is required." -ForegroundColor Red
-    Write-Host "Usage: .\rebuild-neo.ps1 <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag] [-RedoLanded]" -ForegroundColor Yellow
+    Write-Host "Usage: .\rebuild-neo.ps1 <base-branch> [<feature-branch>] [-f] [-n] [-RebuiltTag] [-RedoLanded] [-MaxCommits <n>]" -ForegroundColor Yellow
     Write-Host "  <base> [<feature>]  positional args, same style as: git rebase <upstream> [<branch>]" -ForegroundColor Yellow
     Write-Host "  -f / -OverwriteTempBranch  overwrite an existing temp branch (mechanical only;" -ForegroundColor Yellow
     Write-Host "                      grants no other guard, never implies -RedoLanded)" -ForegroundColor Yellow
@@ -234,6 +240,8 @@ if ([string]::IsNullOrWhiteSpace($BaseBranch)) {
     Write-Host "  -RebuiltTag         append ' (Rebuilt)' to rebuilt merge messages (default: off)" -ForegroundColor Yellow
     Write-Host "  -RedoLanded         redo a rebuild that was already landed (distinct from -f;" -ForegroundColor Yellow
     Write-Host "                      -f alone never bypasses the landed guard)" -ForegroundColor Yellow
+    Write-Host "  -MaxCommits <n>     refuse when the range has more than n first-parent commits" -ForegroundColor Yellow
+    Write-Host "                      (default 10; -1 = unlimited but warns above 10)" -ForegroundColor Yellow
     exit 1
 }
 
@@ -449,6 +457,49 @@ if ($RebuiltTag) {
     Write-Host " Rebuilt tag: ' (Rebuilt)' appended to rebuilt merge messages" -ForegroundColor Yellow
 }
 Write-Host "========================================" -ForegroundColor Cyan
+
+# ===== Range guards - run BEFORE any mutation (no fetch, no stash, no park, no checkout) =====
+# --first-parent: replay only mainline nodes (merges stay merges; no double-apply of side-branch commits)
+$commits = Invoke-Git -Query -CommandArgs @('log', "$BaseBranch..$FeatureBranch", '--first-parent', '--reverse', '--oneline')
+
+# Nothing to replay: same branch, or the feature is already fully contained in base.
+# Don't fall through to a misleading "Rebuild completed!" banner.
+if (-not $commits -or @($commits).Count -eq 0) {
+    if (Test-Ancestor $FeatureBranch $BaseBranch) {
+        $fTip = (git rev-parse --short=8 $FeatureBranch 2>$null)
+        $bTip = (git rev-parse --short=8 $BaseBranch 2>$null)
+        Write-Host "Nothing to rebuild: '$FeatureBranch' is already fully contained in '$BaseBranch'." -ForegroundColor Yellow
+        Write-EvidenceFrame -Lines @("evidence: '$FeatureBranch' (@$fTip) is an ancestor of '$BaseBranch' (@$bTip).") -Color Yellow
+    } else {
+        Write-Host "Nothing to rebuild: '$BaseBranch..$FeatureBranch' has no first-parent commits." -ForegroundColor Yellow
+    }
+    exit 0
+}
+
+# Max-commits guard: replay re-creates every listed commit, so large ranges are refused
+# by default instead of silently executing (destructive-scale work needs a conscious
+# decision - hence the consent reminder on any suggestion to raise/disable the limit).
+#   -MaxCommits N (default 10): refuse when the range has MORE than N commits
+#   -MaxCommits -1: unlimited, but still WARN when the range exceeds the default (10)
+# Applied uniformly (including -DryRun): the plan preview obeys the same ceiling.
+if ($MaxCommits -lt 1 -and $MaxCommits -ne -1) {
+    Write-Host "Error: -MaxCommits must be a positive number or -1 (unlimited); got '$MaxCommits'." -ForegroundColor Red
+    exit 1
+}
+$commitCount = @($commits).Count
+if ($MaxCommits -eq -1) {
+    if ($commitCount -gt 10) {
+        Write-Host " WARNING: -MaxCommits -1 (unlimited): '$BaseBranch..$FeatureBranch' has $commitCount commits (default limit is 10)." -ForegroundColor Yellow
+        Write-AgentConsentReminder -Action "replaying all $commitCount commits despite the default limit of 10 (-MaxCommits -1)"
+    }
+} elseif ($commitCount -gt $MaxCommits) {
+    Write-Host "Refusing to run: '$BaseBranch..$FeatureBranch' has $commitCount commits (limit: $MaxCommits)." -ForegroundColor Red
+    Write-Host "  Show the list:  git log --oneline --first-parent $BaseBranch..$FeatureBranch" -ForegroundColor Yellow
+    Write-Host "  To proceed:     -MaxCommits $commitCount   (custom limit)" -ForegroundColor Yellow
+    Write-Host "              or  -MaxCommits -1            (unlimited; warns above 10)" -ForegroundColor Yellow
+    Write-AgentConsentReminder -Action "raising -MaxCommits to replay $commitCount commits"
+    exit 1
+}
 
 if (-not (Test-Path $PatchDir)) {
     Write-Host ('  $ New-Item -ItemType Directory -Path ' + $PatchDir) -ForegroundColor DarkGray
@@ -741,23 +792,6 @@ Invoke-Git -Separator -CommandArgs @('checkout', $CheckoutAction, $NewBranch, $B
 if (-not $DryRun -and $LASTEXITCODE -ne 0) {
     Write-Host "Error: cannot create or switch to temp branch $NewBranch" -ForegroundColor Red
     exit 1
-}
-
-# --first-parent: replay only mainline nodes (merges stay merges; no double-apply of side-branch commits)
-$commits = Invoke-Git -Query -CommandArgs @('log', "$BaseBranch..$FeatureBranch", '--first-parent', '--reverse', '--oneline')
-
-# Nothing to replay: same branch, or the feature is already fully contained in base.
-# Don't fall through to a misleading "Rebuild completed!" banner.
-if (-not $commits -or @($commits).Count -eq 0) {
-    if (Test-Ancestor $FeatureBranch $BaseBranch) {
-        $fTip = (git rev-parse --short=8 $FeatureBranch 2>$null)
-        $bTip = (git rev-parse --short=8 $BaseBranch 2>$null)
-        Write-Host "Nothing to rebuild: '$FeatureBranch' is already fully contained in '$BaseBranch'." -ForegroundColor Yellow
-        Write-EvidenceFrame -Lines @("evidence: '$FeatureBranch' (@$fTip) is an ancestor of '$BaseBranch' (@$bTip).") -Color Yellow
-    } else {
-        Write-Host "Nothing to rebuild: '$BaseBranch..$FeatureBranch' has no first-parent commits." -ForegroundColor Yellow
-    }
-    exit 0
 }
 
 # One shared, zero-padded node counter (001, 002, ...) covering BOTH header types so the
