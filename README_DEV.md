@@ -8,7 +8,9 @@
 |---|---|
 | `rebuild-neo.ps1` | 主腳本（UTF-8 with BOM，訊息全英文） |
 | `rebuild-neo.bat` | 啟動器（chcp 65001、轉傳 %*、失敗 pause） |
+| `rebuild-neo.sh` | POSIX sh 啟動器（Linux / macOS：檢查 `pwsh` 存在後 `-NoProfile -File` 轉傳 %*；失敗僅互動終端 pause） |
 | `git-rebuild-merges.bat` | git 子命令別名啟動器（`call` 轉發給 `rebuild-neo.bat`，行為單一來源） |
+| `git-rebuild-merges` | git 子命令別名啟動器（POSIX sh，`exec` 轉發給 `rebuild-neo.sh`，行為單一來源） |
 | `README.md` | **面向使用者**的說明（用法／安全機制／落地指令），中文版；英文版見 `README.en.md`；本檔（README_DEV.md）為開發紀錄，收尾時更新 |
 | `rebuild-neo-tests/build-mixed-001.ps1` | 夾具分支 `tmp/rebuild-mixed-001` 建構腳本（base=neo） |
 | `rebuild-neo-tests/build-mixed-neo-001.ps1` | 夾具分支 `tmp/rebuild-mixed-neo-001` 建構腳本（base=ad607938，含中段合併 neo） |

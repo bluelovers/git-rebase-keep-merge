@@ -1,0 +1,16 @@
+#!/usr/bin/env sh
+# ============================================================
+# git-rebuild-merges alias launcher (git subcommand style, POSIX sh)
+# Forwards all arguments to rebuild-neo.sh - the canonical
+# launcher - so there is a single source of behavior.
+#
+# Usage: git rebuild-merges <base-branch> [<feature-branch>] [選項]
+#        (requires this directory on PATH, file must be executable;
+#         same options as rebuild-neo)
+#
+# Runs in the CURRENT directory: cd into the target repo first.
+# ============================================================
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+exec sh "$SCRIPT_DIR/rebuild-neo.sh" "$@"

@@ -37,9 +37,20 @@ rebuild-neo <base> [<feature>] [選項]
 
 （即 `rebuild-neo.bat`，內部呼叫 `rebuild-neo.ps1`。）
 
+Linux / macOS 下用 POSIX sh 啟動器（轉發給 `rebuild-neo.ps1`，需先安裝 `pwsh` — PowerShell 7+ — 並在 `PATH` 上）：
+
+```
+./rebuild-neo.sh <base> [<feature>] [選項]
+```
+
+（首次使用先 `chmod +x rebuild-neo.sh`，或直接 `sh rebuild-neo.sh ...`。找不到 `pwsh` 時會明確報錯並以 127 退出。）
+
 ### `git-rebuild-merges` 別名
 
-把本目錄加入 `PATH` 後，可用 git 子命令形式呼叫（`git-rebuild-merges.bat` 轉發給 `rebuild-neo.bat`，行為完全一致）：
+把本目錄加入 `PATH` 後，可用 git 子命令形式呼叫（行為完全一致、單一來源）：
+
+- Windows：`git-rebuild-merges.bat` 轉發給 `rebuild-neo.bat`
+- Linux / macOS：`git-rebuild-merges`（無副檔名）`exec` 轉發給 `rebuild-neo.sh`（需 `chmod +x git-rebuild-merges`）
 
 ```
 git rebuild-merges <base> [<feature>] [選項]
@@ -120,7 +131,9 @@ git branch -D rebuild/<feature>-rebuilt
 | 檔案 | 說明 |
 |---|---|
 | `rebuild-neo.bat` / `rebuild-neo.ps1` | 主腳本 |
+| `rebuild-neo.sh` | POSIX sh 啟動器（Linux / macOS，經 `pwsh` 呼叫 `rebuild-neo.ps1`） |
 | `git-rebuild-merges.bat` | git 子命令別名啟動器（轉發給 `rebuild-neo.bat`） |
+| `git-rebuild-merges` | git 子命令別名啟動器（POSIX sh，`exec` 轉發給 `rebuild-neo.sh`） |
 | `rebuild-neo-tests/` | 測試分支的一鍵建構腳本 |
 | `README.en.md` | 本 README 的英文版 |
 | `README_DEV.md` | 開發紀錄：設計決策、實測案例與驗證方法 |

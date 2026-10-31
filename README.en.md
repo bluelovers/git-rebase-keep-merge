@@ -38,9 +38,20 @@ rebuild-neo <base> [<feature>] [options]
 
 (i.e. `rebuild-neo.bat`, which internally invokes `rebuild-neo.ps1`.)
 
+On Linux / macOS, use the POSIX sh launcher (forwards to `rebuild-neo.ps1`; requires `pwsh` — PowerShell 7+ — installed and on `PATH`):
+
+```
+./rebuild-neo.sh <base> [<feature>] [options]
+```
+
+(Run `chmod +x rebuild-neo.sh` once, or invoke it as `sh rebuild-neo.sh ...`. If `pwsh` is missing it reports a clear error and exits with 127.)
+
 ### `git-rebuild-merges` alias
 
-With this directory on your `PATH`, you can invoke it as a git subcommand (`git-rebuild-merges.bat` forwards to `rebuild-neo.bat`; behavior is identical):
+With this directory on your `PATH`, you can invoke it as a git subcommand (identical behavior, single source of truth):
+
+- Windows: `git-rebuild-merges.bat` forwards to `rebuild-neo.bat`
+- Linux / macOS: `git-rebuild-merges` (no extension) `exec`s into `rebuild-neo.sh` (run `chmod +x git-rebuild-merges` first)
 
 ```
 git rebuild-merges <base> [<feature>] [options]
@@ -121,7 +132,9 @@ Yes. The merge nodes are rebuilt as new commits, so their hashes necessarily dif
 | File | Description |
 |---|---|
 | `rebuild-neo.bat` / `rebuild-neo.ps1` | Main scripts |
+| `rebuild-neo.sh` | POSIX sh launcher (Linux / macOS; invokes `rebuild-neo.ps1` via `pwsh`) |
 | `git-rebuild-merges.bat` | git subcommand alias launcher (forwards to `rebuild-neo.bat`) |
+| `git-rebuild-merges` | git subcommand alias launcher (POSIX sh; `exec`s into `rebuild-neo.sh`) |
 | `rebuild-neo-tests/` | One-click fixture-branch build scripts |
 | `README.md` | Traditional Chinese version of this README |
 | `README_DEV.md` | Development log: design decisions, test cases, and verification methods |
